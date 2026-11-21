@@ -1482,7 +1482,7 @@ static size_t gather(vector<Scatter<R>>& sc, int p, vector<R>& out) {
 // ---- line scanning -------------------------------------------------------------
 // Scans the line at p: returns its length (up to '\n' or bufend); records the
 // offsets of up to 8 commas in cpos, the comma count in nc and the quote count in nq.
-static inline size_t scan_line(const char* p, const char* bufend, u32* cpos, int& nc, int& nq) {
+__attribute__((always_inline)) static inline size_t scan_line(const char* p, const char* bufend, u32* cpos, int& nc, int& nq) {
     nc = 0;
     nq = 0;
     const __m256i NLv = _mm256_set1_epi8('\n'), CMv = _mm256_set1_epi8(','), QTv = _mm256_set1_epi8('"');
@@ -1542,7 +1542,7 @@ static inline bool fields(const char* p, size_t len, const u32* cp, int nc, int 
     return true;
 }
 template <class F>
-static void for_lines_fast(const Task& t, F&& f) {
+__attribute__((flatten)) static void for_lines_fast(const Task& t, F&& f) {
     const char* b = t.b;
     const char* bufend = b + t.size;
     size_t pos = first_line(t);
@@ -2092,6 +2092,16 @@ static int selftest() {
 }
 
 int main(int argc, char** argv) {
+#ifdef SS_DISPATCH_TO
+    // This build targets x86-64-v3 (AVX2). If the CPU has everything x86-64-v4
+    // needs (AVX-512 F/BW/CD/DQ/VL), hand over to the AVX-512 build. If that
+    // binary is missing or exec fails, keep running this one.
+    __builtin_cpu_init();
+    if (!getenv("SS_NO_V4") && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+        __builtin_cpu_supports("avx512cd") && __builtin_cpu_supports("avx512dq") &&
+        __builtin_cpu_supports("avx512vl"))
+        execv(SS_DISPATCH_TO, argv);
+#endif
     T0 = chrono::steady_clock::now();
     DBG = getenv("SS_DEBUG") != nullptr;
     init_codes();
