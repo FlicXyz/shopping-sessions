@@ -1403,6 +1403,7 @@ static_assert(sizeof(EvRec) == 32 && sizeof(PRec) == 16 && sizeof(CRec) == 24, "
 struct Slab {
     char* p = nullptr;
     size_t left = 0;
+    vector<pair<char*, size_t>> regions;  // for releasing memory before exit
 };
 static void* slab_alloc(Slab& s, size_t n) {
     n = (n + 63) & ~(size_t)63;
@@ -1415,6 +1416,7 @@ static void* slab_alloc(Slab& s, size_t n) {
         madvise(a, sz, MADV_HUGEPAGE);
         s.p = a;
         s.left = sz;
+        s.regions.push_back({a, sz});
     }
     void* r = s.p;
     s.p += n;
@@ -1607,9 +1609,9 @@ static void run() {
         while (b < hi && ((u64)1 << b) * per < n) b++;
         return b;
     };
-    PE_BITS = bits_for(est_events, 12000, 6, 13);
+    PE_BITS = bits_for(est_events, getenv("SS_PE") ? (u64)atoi(getenv("SS_PE")) : 12000, 6, 13);
     NPE = 1 << PE_BITS;
-    PP_BITS = bits_for(est_events, 16000, 6, 13);
+    PP_BITS = bits_for(est_events, getenv("SS_PP") ? (u64)atoi(getenv("SS_PP")) : 16000, 6, 13);
     NPP = 1 << PP_BITS;
 
     vector<Thr> th(NT);
@@ -2101,7 +2103,21 @@ static void run() {
     {
         size_t total_rows = 0;
         for (auto& t : th) total_rows += t.uid.size();
-        par_for(NT, [&](int ti, int) {
+        // After the NT writer tasks, release memory in parallel (MADV_DONTNEED takes
+        // the mmap lock shared) so the single-threaded teardown at exit is short.
+        vector<pair<const char*, size_t>> rel;
+        for (auto& t : th)
+            for (auto& r : t.slab.regions) rel.push_back(r);
+        for (auto* v : {&EVF, &CLF, &LKF})
+            for (auto& m : *v)
+                for (size_t o = 0; o < m.n; o += (size_t)256 << 20)
+                    rel.push_back({m.p + o, min(m.n - o, (size_t)256 << 20)});
+        par_for(NT + (int)rel.size(), [&](int ti, int) {
+            if (ti >= NT) {
+                const auto& r = rel[ti - NT];
+                madvise((void*)r.first, r.second, MADV_DONTNEED);
+                return;
+            }
             Thr& T = th[ti];
             size_t n = T.uid.size();
             if (n == 0 && !(ti == 0 && total_rows == 0)) return;
