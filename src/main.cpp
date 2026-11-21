@@ -924,6 +924,12 @@ static inline void person_prefetch(u64 k) {
     __builtin_prefetch(LMF.data() + lm_base(h) + (h & LSUB_MASK));
 }
 
+#ifdef SS_PROF
+static atomic<u64> PROFC[8];
+#define PROF(i) do { u64 _t = __rdtsc(); PROFC[i] += _t - _pl; _pl = _t; } while (0)
+#else
+#define PROF(i) do {} while (0)
+#endif
 static void build_links();  // defined after namespace fast (uses its line scanner)
 
 // ===========================================================================
@@ -1487,32 +1493,6 @@ static inline u64 load8(const char* p) {
     return v;
 }
 
-// Stable LSD radix sort of u64 keys by their low 32 bits (8-bit digits; a pass
-// whose digit is the same for every key is skipped). tmp needs n slots.
-static void radix_sort_low32(u64* a, u64* tmp, size_t n) {
-    u32 h[4][256];
-    memset(h, 0, sizeof h);
-    for (size_t i = 0; i < n; i++) {
-        const u32 v = (u32)a[i];
-        h[0][v & 255]++;
-        h[1][(v >> 8) & 255]++;
-        h[2][(v >> 16) & 255]++;
-        h[3][v >> 24]++;
-    }
-    u64* src = a;
-    u64* dst = tmp;
-    for (int pass = 0; pass < 4; pass++) {
-        const int sh = 8 * pass;
-        u32* hp = h[pass];
-        if (hp[((u32)src[0] >> sh) & 255] == n) continue;
-        u32 off[256], acc = 0;
-        for (int d = 0; d < 256; d++) off[d] = acc, acc += hp[d];
-        for (size_t i = 0; i < n; i++) dst[off[((u32)src[i] >> sh) & 255]++] = src[i];
-        swap(src, dst);
-    }
-    if (src != a) memcpy(a, src, n * sizeof(u64));
-}
-
 // ---- per-thread state -----------------------------------------------------------
 struct Thr {
     Slab slab;
@@ -1803,6 +1783,9 @@ static void run() {
             const int p = order[oi];
             const size_t ne = psize[p];
             if (!ne) return;
+#ifdef SS_PROF
+            u64 _pl = __rdtsc();
+#endif
             Thr& T = th[tid];
             Local& L = locs[tid];
             if (L.keys.size() < ne) L.keys.resize(ne + ne / 4), L.tmp.resize(ne + ne / 4);
@@ -1862,36 +1845,53 @@ static void run() {
                         if (r[k].aux) L.pur.push_back(PK{key, r[k].aux, 0});
                     }
                 }
-            // counting sort by the dense person index, then each person's times
+            PROF(0);
+            // Sort by (person index, ts): a stable LSD radix sort on ts (11-bit
+            // digits; a digit that is the same for every key is skipped), then a
+            // stable counting pass by person index.
             {
                 const size_t npers = L.pid.size();
                 L.cnt.assign(npers + 1, 0);
                 u32* cn = L.cnt.data();
-                for (size_t x = 0; x < ne; x++) cn[(KT[x] >> 32) + 1]++;
-                for (size_t x = 0; x < npers; x++) cn[x + 1] += cn[x];
-                for (size_t x = 0; x < ne; x++) K[cn[KT[x] >> 32]++] = KT[x];
-                // cn[q] is now the end of person q's run
-                size_t a0 = 0;
-                for (size_t q = 0; q < npers; q++) {
-                    const size_t a1 = cn[q];
-                    const size_t len = a1 - a0;
-                    if (len > 1) {
-                        if (len <= 16) {
-                            for (size_t x = a0 + 1; x < a1; x++) {
-                                const u64 v = K[x];
-                                size_t y = x;
-                                while (y > a0 && K[y - 1] > v) K[y] = K[y - 1], y--;
-                                K[y] = v;
-                            }
-                        } else if (len < 256)
-                            sort(K + a0, K + a1);
-                        else
-                            radix_sort_low32(K + a0, KT, len);  // KT is free after the counting sort
-                    }
-                    a0 = a1;
+                u32 h[3][2048];
+                memset(h, 0, sizeof h);
+                for (size_t x = 0; x < ne; x++) {
+                    const u64 v = KT[x];
+                    const u32 t = (u32)v;
+                    h[0][t & 2047]++;
+                    h[1][(t >> 11) & 2047]++;
+                    h[2][t >> 22]++;
+                    cn[(v >> 32) + 1]++;
                 }
+                PROF(1);
+                u64* src = KT;
+                u64* dst = K;
+                for (int d = 0; d < 3; d++) {
+                    u32* hd = h[d];
+                    const int sh = 11 * d;
+                    if (hd[((u32)src[0] >> sh) & 2047] == (u32)ne) continue;
+                    u32 sum = 0;
+                    for (int b = 0; b < 2048; b++) {
+                        const u32 c = hd[b];
+                        hd[b] = sum;
+                        sum += c;
+                    }
+                    for (size_t x = 0; x < ne; x++) {
+                        const u64 v = src[x];
+                        dst[hd[((u32)v >> sh) & 2047]++] = v;
+                    }
+                    swap(src, dst);
+                }
+                for (size_t x = 0; x < npers; x++) cn[x + 1] += cn[x];
+                for (size_t x = 0; x < ne; x++) {
+                    const u64 v = src[x];
+                    dst[cn[v >> 32]++] = v;
+                }
+                K = dst;
             }
+            PROF(2);
             sort(L.pur.begin(), L.pur.end(), [](const PK& x, const PK& y) { return x.key < y.key; });
+            PROF(3);
             for (auto& sc : scs)
                 for (Blk* b = sc.head[p]; b; b = b->next) {
                     const CRec* c = bdata<CRec>(b);
@@ -1909,17 +1909,41 @@ static void run() {
                         }
                     }
                 }
-            // clicks: counting sort by person index, then each person's run by
-            // (ts, click_id descending) so the smallest click_id comes last
+            // clicks: sorted by (person index, ts) the same way as the events, then
+            // equal keys by click_id descending, so the smallest click_id comes last
+            PROF(4);
             const size_t nc = L.ck.size();
             if (L.ck2.size() < nc) L.ck2.resize(nc + nc / 4 + 16);
-            {
+            const CK* C = L.ck.data();
+            if (nc) {
                 const size_t npers = L.pid.size();
                 L.cnt.assign(npers + 1, 0);
                 u32* cn = L.cnt.data();
-                const CK* src = L.ck.data();
+                CK* src = L.ck.data();
                 CK* dst = L.ck2.data();
-                for (size_t x = 0; x < nc; x++) cn[(src[x].key >> 32) + 1]++;
+                u32 h[3][2048];
+                memset(h, 0, sizeof h);
+                for (size_t x = 0; x < nc; x++) {
+                    const u64 v = src[x].key;
+                    const u32 t = (u32)v;
+                    h[0][t & 2047]++;
+                    h[1][(t >> 11) & 2047]++;
+                    h[2][t >> 22]++;
+                    cn[(v >> 32) + 1]++;
+                }
+                for (int d = 0; d < 3; d++) {
+                    u32* hd = h[d];
+                    const int sh = 11 * d;
+                    if (hd[((u32)src[0].key >> sh) & 2047] == (u32)nc) continue;
+                    u32 sum = 0;
+                    for (int b = 0; b < 2048; b++) {
+                        const u32 c = hd[b];
+                        hd[b] = sum;
+                        sum += c;
+                    }
+                    for (size_t x = 0; x < nc; x++) dst[hd[((u32)src[x].key >> sh) & 2047]++] = src[x];
+                    swap(src, dst);
+                }
                 for (size_t x = 0; x < npers; x++) cn[x + 1] += cn[x];
                 for (size_t x = 0; x < nc; x++) dst[cn[src[x].key >> 32]++] = src[x];
                 auto cl = [](const CK& x, const CK& y) {
@@ -1927,26 +1951,19 @@ static void run() {
                     if (x.cid == y.cid) return false;
                     return key_less(y.cid, x.cid);
                 };
-                size_t a0 = 0;
-                for (size_t q = 0; q < npers; q++) {
-                    const size_t a1 = cn[q];
-                    if (a1 - a0 > 1) {
-                        if (a1 - a0 <= 16) {
-                            for (size_t x = a0 + 1; x < a1; x++) {
-                                const CK v = dst[x];
-                                size_t y = x;
-                                while (y > a0 && cl(v, dst[y - 1])) dst[y] = dst[y - 1], y--;
-                                dst[y] = v;
-                            }
-                        } else
-                            sort(dst + a0, dst + a1, cl);
+                // runs of equal keys are short: insertion sort them in place
+                for (size_t x = 1; x < nc; x++)
+                    if (dst[x].key == dst[x - 1].key) {
+                        const CK v = dst[x];
+                        size_t y = x;
+                        while (y > 0 && cl(v, dst[y - 1])) dst[y] = dst[y - 1], y--;
+                        dst[y] = v;
                     }
-                    a0 = a1;
-                }
+                C = dst;
             }
+            PROF(5);
             const PK* P = L.pur.data();
             const size_t npur = L.pur.size();
-            const CK* C = L.ck2.data();
             size_t pp = 0, cp = 0;
             i = 0;
             while (i < ne) {
@@ -2034,8 +2051,15 @@ static void run() {
                 T.active.clear();
                 i = j;
             }
+            PROF(6);
         });
         tick("sessions");
+#ifdef SS_PROF
+        {
+            const char* nm[] = {"map+keys", "count sort", "person sort", "pur sort", "click map", "click sort", "sweep"};
+            for (int q = 0; q < 7; q++) fprintf(stderr, "    %-12s %8.1f Mcyc\n", nm[q], PROFC[q] / 1e6);
+        }
+#endif
     }
 
     // ---- write ------------------------------------------------------------------------
