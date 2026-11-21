@@ -908,7 +908,23 @@ static inline void uf_union(atomic<u32>* par, u32 a, u32 b) {
 // Links -> a flat table split into NLP equal sub-tables by the top LB bits of
 // the key's hash. Each linked ID maps to its person's name.
 static const int LB = 10, NLP = 1 << LB;
-static vector<KV> LMF;
+// Huge-page backed, zero-filled array (fresh anonymous memory is already zero).
+template <class T>
+static T* huge_zeroed(size_t n) {
+    size_t bytes = max<size_t>(n * sizeof(T), 4096);
+    size_t big = bytes + ((size_t)2 << 20);
+    void* m = mmap(nullptr, big, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m == MAP_FAILED) die("mmap failed");
+    char* a = (char*)(((uintptr_t)m + ((2 << 20) - 1)) & ~(uintptr_t)((2 << 20) - 1));
+    madvise(a, bytes, MADV_HUGEPAGE);
+    return (T*)a;
+}
+struct KVArr {
+    KV* p = nullptr;
+    size_t n = 0;
+    KV* data() const { return p; }
+};
+static KVArr LMF;
 static u64 LSUB_MASK;
 static int LSUB_BITS;
 static inline size_t lm_base(u64 h) { return (size_t)(h >> (64 - LB)) << LSUB_BITS; }
@@ -967,7 +983,8 @@ static void build_links() {
     LSUB_BITS = 4;
     while (((size_t)1 << LSUB_BITS) < (size_t)mx * 2) LSUB_BITS++;
     LSUB_MASK = ((u64)1 << LSUB_BITS) - 1;
-    LMF.assign((size_t)NLP << LSUB_BITS, KV{0, 0});
+    LMF.n = (size_t)NLP << LSUB_BITS;
+    LMF.p = huge_zeroed<KV>(LMF.n);
     vector<u32> base(NLP + 1, 0);
     for (int p = 0; p < NLP; p++) base[p + 1] = base[p] + cnt[p];
     u32 N = base[NLP];
