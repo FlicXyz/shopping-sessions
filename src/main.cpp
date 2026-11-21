@@ -1487,6 +1487,32 @@ static inline u64 load8(const char* p) {
     return v;
 }
 
+// Stable LSD radix sort of u64 keys by their low 32 bits (8-bit digits; a pass
+// whose digit is the same for every key is skipped). tmp needs n slots.
+static void radix_sort_low32(u64* a, u64* tmp, size_t n) {
+    u32 h[4][256];
+    memset(h, 0, sizeof h);
+    for (size_t i = 0; i < n; i++) {
+        const u32 v = (u32)a[i];
+        h[0][v & 255]++;
+        h[1][(v >> 8) & 255]++;
+        h[2][(v >> 16) & 255]++;
+        h[3][v >> 24]++;
+    }
+    u64* src = a;
+    u64* dst = tmp;
+    for (int pass = 0; pass < 4; pass++) {
+        const int sh = 8 * pass;
+        u32* hp = h[pass];
+        if (hp[((u32)src[0] >> sh) & 255] == n) continue;
+        u32 off[256], acc = 0;
+        for (int d = 0; d < 256; d++) off[d] = acc, acc += hp[d];
+        for (size_t i = 0; i < n; i++) dst[off[((u32)src[i] >> sh) & 255]++] = src[i];
+        swap(src, dst);
+    }
+    if (src != a) memcpy(a, src, n * sizeof(u64));
+}
+
 // ---- per-thread state -----------------------------------------------------------
 struct Thr {
     Slab slab;
@@ -1857,8 +1883,10 @@ static void run() {
                                 while (y > a0 && K[y - 1] > v) K[y] = K[y - 1], y--;
                                 K[y] = v;
                             }
-                        } else
+                        } else if (len < 256)
                             sort(K + a0, K + a1);
+                        else
+                            radix_sort_low32(K + a0, KT, len);  // KT is free after the counting sort
                     }
                     a0 = a1;
                 }
