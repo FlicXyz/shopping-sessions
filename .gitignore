@@ -1,0 +1,8 @@
+# Data and local artifacts (repo must stay <50 MB with no data)
+dev/
+out/
+dev-answer/
+_other-starters/
+generator/
+__pycache__/
+*.parquet
