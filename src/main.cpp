@@ -944,95 +944,7 @@ static inline void person_prefetch(u64 k) {
     __builtin_prefetch(LMF.data() + lm_base(h) + (h & LSUB_MASK));
 }
 
-static void build_links() {
-    size_t chunk = max<size_t>(64 << 10, LK_BYTES / (NT * 8) + 1);
-    vector<Task> lt;
-    add_tasks(lt, LKF, 2, chunk);
-    int NL = (int)lt.size();
-    vector<vector<pair<u64, u64>>> pairs(NL);
-    vector<vector<u64>> lk((size_t)NL * NLP);
-    par_for(NL, [&](int i, int) {
-        auto& out = pairs[i];
-        for_lines(lt[i], [&](const char* p, const char* e) {
-            const char* f[2];
-            u32 l[2];
-            if (!split<2>(p, e, f, l) || !l[0] || !l[1]) return;
-            u64 a = key_of(f[0], l[0]), b = key_of(f[1], l[1]);
-            out.push_back({a, b});
-            lk[(size_t)i * NLP + (mix64(a) >> (64 - LB))].push_back(a);
-            lk[(size_t)i * NLP + (mix64(b) >> (64 - LB))].push_back(b);
-        });
-    });
-    // distinct keys per sub-table
-    vector<FMap> loc(NLP);
-    vector<u32> cnt(NLP, 0);
-    par_for(NLP, [&](int p, int) {
-        size_t n = 0;
-        for (int i = 0; i < NL; i++) n += lk[(size_t)i * NLP + p].size();
-        loc[p].init(n);
-        u32 c = 0;
-        for (int i = 0; i < NL; i++)
-            for (u64 k : lk[(size_t)i * NLP + p]) {
-                KV* s = loc[p].slot(k);
-                if (!s->k) s->k = k, s->v = c++;
-            }
-        cnt[p] = c;
-    });
-    u32 mx = 0;
-    for (u32 c : cnt) mx = max(mx, c);
-    LSUB_BITS = 4;
-    while (((size_t)1 << LSUB_BITS) < (size_t)mx * 2) LSUB_BITS++;
-    LSUB_MASK = ((u64)1 << LSUB_BITS) - 1;
-    LMF.n = (size_t)NLP << LSUB_BITS;
-    LMF.p = huge_zeroed<KV>(LMF.n);
-    vector<u32> base(NLP + 1, 0);
-    for (int p = 0; p < NLP; p++) base[p + 1] = base[p] + cnt[p];
-    u32 N = base[NLP];
-    vector<u64> keys(N);
-    par_for(NLP, [&](int p, int) {
-        KV* t = LMF.data() + ((size_t)p << LSUB_BITS);
-        for (auto& e : loc[p].t)
-            if (e.k) {
-                keys[base[p] + e.v] = e.k;
-                u64 s = mix64(e.k) & LSUB_MASK;
-                while (t[s].k) s = (s + 1) & LSUB_MASK;
-                t[s].k = e.k;
-                t[s].v = base[p] + e.v;
-            }
-        FMap().t.swap(loc[p].t);
-    });
-    vector<atomic<u32>> par(N);
-    for (u32 i = 0; i < N; i++) par[i].store(i, memory_order_relaxed);
-    auto gidx = [&](u64 k) {
-        u64 h = mix64(k);
-        const KV* t = LMF.data() + lm_base(h);
-        u64 s = h & LSUB_MASK;
-        while (t[s].k != k) s = (s + 1) & LSUB_MASK;
-        return (u32)t[s].v;
-    };
-    par_for(NL, [&](int i, int) {
-        for (auto& pr : pairs[i]) uf_union(par.data(), gidx(pr.first), gidx(pr.second));
-    });
-    vector<atomic<u64>> nm(N);
-    for (u32 i = 0; i < N; i++) nm[i].store(keys[i], memory_order_relaxed);
-    int NB = (int)((N + 65535) / 65536);
-    par_for(NB, [&](int b, int) {
-        u32 lo = (u32)b * 65536, hi = min<u32>(N, lo + 65536);
-        for (u32 i = lo; i < hi; i++) {
-            u32 r = uf_find(par.data(), i);
-            if (r == i) continue;
-            u64 k = keys[i];
-            u64 cur = nm[r].load(memory_order_relaxed);
-            while (key_less(k, cur) && !nm[r].compare_exchange_weak(cur, k)) {
-            }
-        }
-    });
-    par_for(NLP, [&](int p, int) {
-        KV* t = LMF.data() + ((size_t)p << LSUB_BITS);
-        for (size_t s = 0; s <= LSUB_MASK; s++)
-            if (t[s].k) t[s].v = nm[uf_find(par.data(), (u32)t[s].v)].load(memory_order_relaxed);
-    });
-}
+static void build_links();  // defined after namespace fast (uses its line scanner)
 
 // ===========================================================================
 // generic: the straightforward implementation (64-bit times, std::sort).
@@ -2179,6 +2091,127 @@ static void run() {
 }
 
 }  // namespace fast
+
+// Links -> LMF, single-threaded and cache-friendly:
+//  1. parse every link line into a flat pair array (AVX2 line scan, SIMD keys)
+//  2. counting-sort pair slots by sub-table (top LB bits of the key hash)
+//  3. per sub-table, a small L1/L2-sized table dedupes keys and assigns dense
+//     ids, written straight back into the pair array (no second lookup)
+//  4. LMF sub-tables are filled sub-table by sub-table (contiguous memory)
+//  5. union-find over the dense ids, then each id's person = smallest key
+static void build_links() {
+    vector<u64> A;  // A[2j], A[2j+1]: the two keys of link j
+    A.reserve(LK_BYTES / 9 + 16);
+    for (auto& m : LKF) {
+        if (!m.n) continue;
+        Task t{m.p, m.n, 0, m.n, 2};
+        const char* const bufend = m.p + m.n;
+        fast::for_lines_fast(t, [&](const char* p, size_t len, const u32* cp, int nc, int nq) {
+            u32 fs[2], fe[2];
+            if (!fast::fields<2>(p, len, cp, nc, nq, fs, fe)) return;
+            const u32 l0 = fe[0] - fs[0], l1 = fe[1] - fs[1];
+            if (!l0 || !l1) return;
+            A.push_back(key_of_fast(p + fs[0], l0, bufend));
+            A.push_back(key_of_fast(p + fs[1], l1, bufend));
+        });
+    }
+    const size_t M = A.size();
+    // 2. group slots by sub-table
+    vector<u32> cnt(NLP + 1, 0);
+    vector<u16> part(M);
+    for (size_t j = 0; j < M; j++) {
+        const u32 q = (u32)(mix64(A[j]) >> (64 - LB));
+        part[j] = (u16)q;
+        cnt[q + 1]++;
+    }
+    for (int q = 0; q < NLP; q++) cnt[q + 1] += cnt[q];
+    vector<u32> ord(M);
+    {
+        vector<u32> at(cnt.begin(), cnt.end() - 1);
+        for (size_t j = 0; j < M; j++) ord[at[part[j]]++] = (u32)j;
+    }
+    // 3. dense ids per sub-table, written back as ids[j]
+    vector<u32> ids(M);
+    vector<u64> keys;  // id -> key
+    keys.reserve(M / 2 + 16);
+    vector<u32> dbase(NLP + 1, 0);
+    u32 maxd = 0;
+    vector<u64> tk;
+    vector<u32> tv;
+    for (int q = 0; q < NLP; q++) {
+        const u32 a0 = cnt[q], a1 = cnt[q + 1];
+        dbase[q] = (u32)keys.size();
+        if (a0 == a1) continue;
+        size_t cap = 16;
+        while (cap < (size_t)(a1 - a0) * 2) cap <<= 1;
+        tk.assign(cap, 0);
+        tv.resize(cap);
+        const u64 mask = cap - 1;
+        for (u32 x = a0; x < a1; x++) {
+            const u32 j = ord[x];
+            const u64 k = A[j];
+            u64 s = mix64(k) & mask;
+            for (;;) {
+                if (tk[s] == k) {
+                    ids[j] = tv[s];
+                    break;
+                }
+                if (!tk[s]) {
+                    tk[s] = k;
+                    tv[s] = (u32)keys.size();
+                    ids[j] = tv[s];
+                    keys.push_back(k);
+                    break;
+                }
+                s = (s + 1) & mask;
+            }
+        }
+        maxd = max(maxd, (u32)keys.size() - dbase[q]);
+    }
+    dbase[NLP] = (u32)keys.size();
+    const u32 N = (u32)keys.size();
+    // 4. LMF: sub-tables of 2^LSUB_BITS slots, at most half full
+    LSUB_BITS = 4;
+    while (((size_t)1 << LSUB_BITS) < (size_t)maxd * 2) LSUB_BITS++;
+    LSUB_MASK = ((u64)1 << LSUB_BITS) - 1;
+    LMF.n = (size_t)NLP << LSUB_BITS;
+    LMF.p = huge_zeroed<KV>(LMF.n);
+    vector<u32> slot(N);
+    for (u32 id = 0; id < N; id++) {
+        const u64 k = keys[id];
+        const u64 h = mix64(k);
+        KV* t = LMF.p + lm_base(h);
+        u64 s = h & LSUB_MASK;
+        while (t[s].k) s = (s + 1) & LSUB_MASK;
+        t[s].k = k;
+        slot[id] = (u32)((t + s) - LMF.p);
+    }
+    // 5. union-find (path halving; the smaller id becomes the root)
+    vector<u32> par(N);
+    for (u32 i = 0; i < N; i++) par[i] = i;
+    auto find = [&](u32 x) {
+        while (par[x] != x) {
+            par[x] = par[par[x]];
+            x = par[x];
+        }
+        return x;
+    };
+    for (size_t j = 0; j < M; j += 2) {
+        u32 a = find(ids[j]), b = find(ids[j + 1]);
+        if (a == b) continue;
+        if (a < b)
+            par[b] = a;
+        else
+            par[a] = b;
+    }
+    vector<u64> nm(keys);  // root -> smallest key of its component
+    for (u32 i = 0; i < N; i++) {
+        const u32 r = find(i);
+        par[i] = r;
+        if (r != i && key_less(keys[i], nm[r])) nm[r] = keys[i];
+    }
+    for (u32 i = 0; i < N; i++) LMF.p[slot[i]].v = nm[par[i]];
+}
 
 // SS_SELFTEST=1: differential tests of the fast helpers against the plain ones.
 static int selftest() {
