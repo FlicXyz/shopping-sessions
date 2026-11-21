@@ -908,9 +908,6 @@ static void write_campaign_daily(const vector<i64>& cs, const vector<i64>& cps, 
 }
 
 
-// Links -> a flat table split into NLP equal sub-tables by the top LB bits of
-// the key's hash. Each linked ID maps to its person's name.
-static const int LB = 10, NLP = 1 << LB;
 // Huge-page backed, zero-filled array (fresh anonymous memory is already zero).
 template <class T>
 static T* huge_zeroed(size_t n) {
@@ -927,25 +924,22 @@ struct KVArr {
     size_t n = 0;
     KV* data() const { return p; }
 };
+// LMF: every linked ID -> its person, one open-addressing table (linear
+// probing from mix64(key) & LMASK, at most about 2/3 full). An ID that is not
+// in it is its own person.
 static KVArr LMF;
-static u64 LSUB_MASK;
-static int LSUB_BITS;
-static inline size_t lm_base(u64 h) { return (size_t)(h >> (64 - LB)) << LSUB_BITS; }
+static u64 LMASK;
 static inline u64 person_of(u64 k) {
-    u64 h = mix64(k);
-    const KV* t = LMF.data() + lm_base(h);
-    u64 s = h & LSUB_MASK;
+    u64 s = mix64(k) & LMASK;
+    const KV* t = LMF.data();
     for (;;) {
         const KV& e = t[s];
         if (e.k == k) return e.v;
         if (!e.k) return k;
-        s = (s + 1) & LSUB_MASK;
+        s = (s + 1) & LMASK;
     }
 }
-static inline void person_prefetch(u64 k) {
-    u64 h = mix64(k);
-    __builtin_prefetch(LMF.data() + lm_base(h) + (h & LSUB_MASK));
-}
+static inline void person_prefetch(u64 k) { __builtin_prefetch(LMF.data() + (mix64(k) & LMASK)); }
 
 #ifdef SS_PROF
 static atomic<u64> PROFC[8];
@@ -2296,13 +2290,12 @@ static void run() {
 
 }  // namespace fast
 
-// Links -> LMF, single-threaded and cache-friendly:
+// Links -> LMF, single-threaded:
 //  1. parse every link line into a flat pair array (AVX2 line scan, SIMD keys)
-//  2. counting-sort pair slots by sub-table (top LB bits of the key hash)
-//  3. per sub-table, a small L1/L2-sized table dedupes keys and assigns dense
-//     ids, written straight back into the pair array (no second lookup)
-//  4. LMF sub-tables are filled sub-table by sub-table (contiguous memory)
-//  5. union-find over the dense ids, then each id's person = smallest key
+//  2. LMF assigns dense ids to the keys (prefetched lookups in input order)
+//  3. union-find over the dense ids
+//  4. each id's person = the smallest key of its component
+//  5. one pass over LMF replaces ids by persons
 static void build_links() {
     vector<u64> A;  // A[2j], A[2j+1]: the two keys of link j
     A.reserve(LK_BYTES / 9 + 16);
@@ -2320,77 +2313,43 @@ static void build_links() {
         });
     }
     const size_t M = A.size();
-    // 2. group slots by sub-table
-    vector<u32> cnt(NLP + 1, 0);
-    vector<u16> part(M);
-    for (size_t j = 0; j < M; j++) {
-        const u32 q = (u32)(mix64(A[j]) >> (64 - LB));
-        part[j] = (u16)q;
-        cnt[q + 1]++;
-    }
-    for (int q = 0; q < NLP; q++) cnt[q + 1] += cnt[q];
-    vector<u32> ord(M);
-    {
-        vector<u32> at(cnt.begin(), cnt.end() - 1);
-        for (size_t j = 0; j < M; j++) ord[at[part[j]]++] = (u32)j;
-    }
-    // 3. dense ids per sub-table, written back as ids[j]
+    // 2. LMF doubles as the key -> dense id table while the components are
+    // found: v holds the id first and the person at the end. Keys are looked
+    // up in input order with the table slot prefetched 16 keys ahead.
+    size_t cap = 16;
+    while (cap < M + M / 2) cap <<= 1;
+    LMASK = cap - 1;
+    LMF.n = cap;
+    LMF.p = huge_zeroed<KV>(cap);
+    KV* T = LMF.p;
     vector<u32> ids(M);
     vector<u64> keys;  // id -> key
     keys.reserve(M / 2 + 16);
-    vector<u32> dbase(NLP + 1, 0);
-    u32 maxd = 0;
-    vector<u64> tk;
-    vector<u32> tv;
-    for (int q = 0; q < NLP; q++) {
-        const u32 a0 = cnt[q], a1 = cnt[q + 1];
-        dbase[q] = (u32)keys.size();
-        if (a0 == a1) continue;
-        size_t cap = 16;
-        while (cap < (size_t)(a1 - a0) * 2) cap <<= 1;
-        tk.assign(cap, 0);
-        tv.resize(cap);
-        const u64 mask = cap - 1;
-        for (u32 x = a0; x < a1; x++) {
-            const u32 j = ord[x];
+    {
+        const size_t D = 16;
+        for (size_t j = 0; j < M && j < D; j++) __builtin_prefetch(T + (mix64(A[j]) & LMASK), 1);
+        for (size_t j = 0; j < M; j++) {
+            if (j + D < M) __builtin_prefetch(T + (mix64(A[j + D]) & LMASK), 1);
             const u64 k = A[j];
-            u64 s = mix64(k) & mask;
+            u64 s = mix64(k) & LMASK;
             for (;;) {
-                if (tk[s] == k) {
-                    ids[j] = tv[s];
+                if (T[s].k == k) {
+                    ids[j] = (u32)T[s].v;
                     break;
                 }
-                if (!tk[s]) {
-                    tk[s] = k;
-                    tv[s] = (u32)keys.size();
-                    ids[j] = tv[s];
+                if (!T[s].k) {
+                    T[s].k = k;
+                    T[s].v = keys.size();
+                    ids[j] = (u32)keys.size();
                     keys.push_back(k);
                     break;
                 }
-                s = (s + 1) & mask;
+                s = (s + 1) & LMASK;
             }
         }
-        maxd = max(maxd, (u32)keys.size() - dbase[q]);
     }
-    dbase[NLP] = (u32)keys.size();
     const u32 N = (u32)keys.size();
-    // 4. LMF: sub-tables of 2^LSUB_BITS slots, at most half full
-    LSUB_BITS = 4;
-    while (((size_t)1 << LSUB_BITS) < (size_t)maxd * 2) LSUB_BITS++;
-    LSUB_MASK = ((u64)1 << LSUB_BITS) - 1;
-    LMF.n = (size_t)NLP << LSUB_BITS;
-    LMF.p = huge_zeroed<KV>(LMF.n);
-    vector<u32> slot(N);
-    for (u32 id = 0; id < N; id++) {
-        const u64 k = keys[id];
-        const u64 h = mix64(k);
-        KV* t = LMF.p + lm_base(h);
-        u64 s = h & LSUB_MASK;
-        while (t[s].k) s = (s + 1) & LSUB_MASK;
-        t[s].k = k;
-        slot[id] = (u32)((t + s) - LMF.p);
-    }
-    // 5. union-find (path halving; the smaller id becomes the root)
+    // 3. union-find (path halving; the smaller id becomes the root)
     vector<u32> par(N);
     for (u32 i = 0; i < N; i++) par[i] = i;
     auto find = [&](u32 x) {
@@ -2408,13 +2367,18 @@ static void build_links() {
         else
             par[a] = b;
     }
+    // 4. each id's person: the smallest key of its component
     vector<u64> nm(keys);  // root -> smallest key of its component
     for (u32 i = 0; i < N; i++) {
         const u32 r = find(i);
         par[i] = r;
         if (r != i && key_less(keys[i], nm[r])) nm[r] = keys[i];
     }
-    for (u32 i = 0; i < N; i++) LMF.p[slot[i]].v = nm[par[i]];
+    vector<u64> pv(N);
+    for (u32 i = 0; i < N; i++) pv[i] = nm[par[i]];
+    // 5. ids -> persons, in one sequential pass over the table
+    for (size_t s = 0; s < cap; s++)
+        if (T[s].k) T[s].v = pv[T[s].v];
 }
 
 // SS_SELFTEST=1: differential tests of the fast helpers against the plain ones.
