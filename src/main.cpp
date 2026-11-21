@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <dirent.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <immintrin.h>
 #include <sys/mman.h>
@@ -1561,7 +1562,6 @@ struct Thr {
     Slab slab;
     Scatter<EvRec> se;
     Scatter<CRec> sc;
-    Scatter<CRec> craw;  // clicks before person resolution (one list)
     Scatter<PRec> sp;
     // pass 3 outputs
     vector<u64> uid;
@@ -1597,13 +1597,14 @@ static void run() {
         t.se.init(NPE, &t.slab, 512);
         static_assert(sizeof(EvRec) * 512 == sizeof(PRec) * 1024, "recycled event blocks must fit person blocks");
         t.sc.init(NPP, &t.slab, 256);
-        t.craw.init(1, &t.slab, 8192);
         t.sp.init(NPP, &t.slab, 1024);
     }
     // ---- links build on their own thread, overlapped with the parse -------------
+    static atomic<bool> links_ready(false);
     thread links_thread([] {
         PAR_NT = getenv("SS_LINK_NT") ? max(1, atoi(getenv("SS_LINK_NT"))) : 2;
         build_links();
+        links_ready.store(true, memory_order_release);
         tick("links built (overlapped)");
     });
     // ---- pass 1: parse events and clicks ------------------------------------------
@@ -1670,9 +1671,24 @@ static void run() {
                     se.push((int)(mix64(r.eid) >> sh), r);
                 });
             } else {
-                // Clicks keep their raw user key (links may still be building);
-                // persons are resolved in pass 2.
-                Scatter<CRec>& cr = T.craw;
+                // Click tasks come after every event task, so the links are
+                // normally built by now. Persons are resolved in batches of 32
+                // with their table slots prefetched, then scattered by person.
+                Scatter<CRec>& sc = T.sc;
+                const int sh = 64 - PP_BITS;
+                CRec pend[32];
+                u32 np = 0;
+                auto flush = [&]() {
+                    if (!links_ready.load(memory_order_acquire))
+                        while (!links_ready.load(memory_order_acquire)) sched_yield();
+                    for (u32 i = 0; i < np; i++) person_prefetch(pend[i].person);
+                    for (u32 i = 0; i < np; i++) {
+                        CRec x = pend[i];
+                        x.person = person_of(x.person);
+                        sc.push((int)(mix64(x.person) >> sh), x);
+                    }
+                    np = 0;
+                };
                 for_lines_fast(t, [&](const char* p, size_t len, const u32* cp, int nc, int nq) {
                     u32 fs[4], fe[4];
                     if (!fields<4>(p, len, cp, nc, nq, fs, fe)) return;
@@ -1688,11 +1704,13 @@ static void run() {
                     c.cid = key_of_fast(p + fs[0], l0, bufend);
                     c.ts = (u32)(ts - CBASE);
                     c.camp = (u32)ce->v;
-                    cr.push(0, c);
+                    pend[np++] = c;
+                    if (np == 32) flush();
                 });
+                flush();
             }
         });
-        for (auto& t : th) t.se.finish(), t.craw.finish();
+        for (auto& t : th) t.se.finish();
         tick("parse events+clicks");
     }
     links_thread.join();
@@ -1707,26 +1725,7 @@ static void run() {
         vector<vector<u32>> tabs(NT);
         vector<vector<u8>> wins(NT);
         vector<vector<u32>> survs(NT);
-        par_for(NT + NPE, [&](int task, int tid) {
-            if (task < NT) {
-                // clicks parsed by thread `task`: resolve persons (prefetched), scatter
-                Scatter<CRec>& sc = th[tid].sc;
-                const int sh = 64 - PP_BITS;
-                for (Blk* b = th[task].craw.head[0]; b; b = b->next) {
-                    CRec* c = bdata<CRec>(b);
-                    const u32 n = b->n;
-                    const u32 D = 16;
-                    for (u32 i = 0; i < n && i < D; i++) person_prefetch(c[i].person);
-                    for (u32 i = 0; i < n; i++) {
-                        if (i + D < n) person_prefetch(c[i + D].person);
-                        CRec x = c[i];
-                        x.person = person_of(x.person);
-                        sc.push((int)(mix64(x.person) >> sh), x);
-                    }
-                }
-                return;
-            }
-            const int p = task - NT;
+        par_for(NPE, [&](int p, int tid) {
             auto& buf = bufs[tid];
             size_t n = gather(ses, p, buf);
             if (!n) return;
