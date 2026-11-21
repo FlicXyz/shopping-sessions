@@ -1814,161 +1814,264 @@ static void run() {
         vector<int> order(NPP);
         for (int p = 0; p < NPP; p++) order[p] = p;
         sort(order.begin(), order.end(), [&](int a, int b) { return psize[a] > psize[b]; });
+        // Per partition: persons get dense local indexes; events become u64 keys
+        // (idx << 32 | ts) sorted as plain integers; purchases and clicks are
+        // side lists sorted by the same key, swept in step with the events.
+        struct PK {
+            u64 key;
+            u32 aux;
+            u32 pad;
+        };
+        struct CK {
+            u64 key;
+            u64 cid;
+            u32 camp;
+            u32 pad;
+        };
         struct Local {
-            vector<PRec> e1, e2;
-            vector<CRec> c1, c2;
-            vector<u32> eb, cb;  // bucket of each record
-            vector<u32> ecnt, ccnt;
+            vector<u64> keys, tmp;
+            vector<u32> cnt;
+            vector<PK> pur;
+            vector<CK> ck, ck2;
+            vector<u64> pid;  // local idx -> person
+            vector<u64> mk;   // person -> idx map (open addressing, key 0 = empty)
+            vector<u32> mv;
+            u64 mmask = 0;
         };
         vector<Local> locs(NT);
         const u64 DAYSHIFT = 4 * 7;  // matches the 4-week shift in DAYBASE
         par_for(NPP, [&](int oi, int tid) {
             const int p = order[oi];
+            const size_t ne = psize[p];
+            if (!ne) return;
             Thr& T = th[tid];
             Local& L = locs[tid];
-            size_t ne = gather(sps, p, L.e1);
-            if (!ne) return;
-            size_t nc = gather(scs, p, L.c1);
-            u32 NB = 1;
-            while (NB * 16 < ne) NB <<= 1;
-            const u64 bm = NB - 1;
-            // counting sort events by bucket
-            L.ecnt.assign(NB + 1, 0);
-            if (L.eb.size() < ne) L.eb.resize(ne);
-            for (size_t i = 0; i < ne; i++) {
-                u32 b = (u32)(mix64(L.e1[i].person) & bm);
-                L.eb[i] = b;
-                L.ecnt[b + 1]++;
-            }
-            for (u32 b = 0; b < NB; b++) L.ecnt[b + 1] += L.ecnt[b];
-            if (L.e2.size() < ne) L.e2.resize(ne);
-            {
-                vector<u32> at(L.ecnt.begin(), L.ecnt.end() - 1);
-                for (size_t i = 0; i < ne; i++) L.e2[at[L.eb[i]]++] = L.e1[i];
-            }
-            L.ccnt.assign(NB + 1, 0);
-            if (L.cb.size() < nc) L.cb.resize(nc);
-            for (size_t i = 0; i < nc; i++) {
-                u32 b = (u32)(mix64(L.c1[i].person) & bm);
-                L.cb[i] = b;
-                L.ccnt[b + 1]++;
-            }
-            for (u32 b = 0; b < NB; b++) L.ccnt[b + 1] += L.ccnt[b];
-            if (L.c2.size() < nc) L.c2.resize(nc);
-            {
-                vector<u32> at(L.ccnt.begin(), L.ccnt.end() - 1);
-                for (size_t i = 0; i < nc; i++) L.c2[at[L.cb[i]]++] = L.c1[i];
-            }
-            PRec* E = L.e2.data();
-            CRec* C = L.c2.data();
-            auto eless = [](const PRec& a, const PRec& b) {
-                return a.person != b.person ? a.person < b.person : a.ts < b.ts;
-            };
-            auto cless = [](const CRec& a, const CRec& b) {
-                if (a.person != b.person) return a.person < b.person;
-                if (a.ts != b.ts) return a.ts < b.ts;
-                if (a.cid == b.cid) return false;
-                return key_less(b.cid, a.cid);  // smallest click_id last
-            };
-            for (u32 b = 0; b < NB; b++) {
-                size_t ea = L.ecnt[b], ee = L.ecnt[b + 1];
-                if (ea == ee) continue;
-                size_t ca = L.ccnt[b], ce = L.ccnt[b + 1];
-                if (ee - ea <= 24) {
-                    for (size_t i = ea + 1; i < ee; i++) {
-                        PRec x = E[i];
-                        size_t j = i;
-                        while (j > ea && eless(x, E[j - 1])) E[j] = E[j - 1], j--;
-                        E[j] = x;
+            if (L.keys.size() < ne) L.keys.resize(ne + ne / 4), L.tmp.resize(ne + ne / 4);
+            L.pur.clear();
+            L.ck.clear();
+            L.pid.clear();
+            size_t cap = 64;
+            while (cap < ne / 4) cap <<= 1;
+            L.mk.assign(cap, 0);
+            L.mv.resize(cap);
+            L.mmask = cap - 1;
+            auto rehash = [&]() {
+                vector<u64> ok;
+                ok.swap(L.mk);
+                vector<u32> ov;
+                ov.swap(L.mv);
+                const size_t ncap = ok.size() * 2;
+                L.mk.assign(ncap, 0);
+                L.mv.resize(ncap);
+                L.mmask = ncap - 1;
+                for (size_t x = 0; x < ok.size(); x++)
+                    if (ok[x]) {
+                        u64 h = mix64(ok[x]) & L.mmask;
+                        while (L.mk[h]) h = (h + 1) & L.mmask;
+                        L.mk[h] = ok[x];
+                        L.mv[h] = ov[x];
                     }
-                } else
-                    sort(E + ea, E + ee, eless);
-                if (ce - ca > 1) sort(C + ca, C + ce, cless);
-                size_t i = ea, cp = ca;
-                while (i < ee) {
-                    const u64 person = E[i].person;
-                    size_t j = i + 1;
-                    while (j < ee && E[j].person == person) j++;
-                    while (cp < ce && C[cp].person < person) cp++;
-                    size_t cA = cp;
-                    while (cp < ce && C[cp].person == person) cp++;
-                    const size_t cB = cp;
-                    size_t lo = cA, hi = cA;
-                    u32 cur_day = 0xFFFFFFFFu;
-                    i32 d_ses = 0, d_evs = 0;
-                    i64 d_rev = 0;
-                    auto flush_day = [&]() {
-                        if (cur_day == 0xFFFFFFFFu) return;
-                        int best = -1;
-                        i64 bestv = -1;
-                        for (int c : T.touched) {
-                            i64 v = T.catsum[c];
-                            if (v > bestv || (v == bestv && c < best)) bestv = v, best = c;
-                            T.catsum[c] = 0;
-                        }
-                        T.touched.clear();
-                        T.uid.push_back(person);
-                        T.day.push_back((i32)(DAY0 + cur_day));
-                        T.ses.push_back(d_ses);
-                        T.evs.push_back(d_evs);
-                        T.rev.push_back(d_rev);
-                        T.top.push_back((i16)best);
-                        d_ses = d_evs = 0;
-                        d_rev = 0;
-                    };
-                    size_t s = i;
-                    while (s < j) {
-                        const u32 start = E[s].ts;
-                        size_t e = s + 1;
-                        while (e < j && E[e].ts - E[e - 1].ts <= (u32)GAP_MS) e++;
-                        const u32 day = (u32)((start + DAYBASE) / (u64)DAY_MS - DAYSHIFT);
-                        if (day != cur_day) {
-                            flush_day();
-                            cur_day = day;
-                        }
-                        i64 rev = 0;
-                        u32 purch = 0;
-                        for (size_t k = s; k < e; k++) {
-                            u32 aux = E[k].aux;
-                            if (aux) {
-                                u32 price = aux & 0xFFFFFFu, c = aux >> 24;
-                                purch = 1;
-                                rev += price;
-                                if (T.catsum[c] == 0) T.touched.push_back((int)c);
-                                T.catsum[c] += price;
+            };
+            u64* K = L.keys.data();
+            u64* KT = L.tmp.data();
+            size_t i = 0;
+            for (auto& sp : sps)
+                for (Blk* b = sp.head[p]; b; b = b->next) {
+                    const PRec* r = bdata<PRec>(b);
+                    for (u32 k = 0; k < b->n; k++) {
+                        const u64 person = r[k].person;
+                        u64 h = mix64(person) & L.mmask;
+                        u32 idx;
+                        for (;;) {
+                            const u64 m = L.mk[h];
+                            if (m == person) {
+                                idx = L.mv[h];
+                                break;
                             }
-                        }
-                        d_ses += 1;
-                        d_evs += (i32)(e - s);
-                        d_rev += rev;
-                        while (hi < cB && C[hi].ts <= start) {
-                            u32 c = C[hi].camp;
-                            if (T.cnt[c]++ == 0) T.pos[c] = (int)T.active.size(), T.active.push_back((int)c);
-                            hi++;
-                        }
-                        while (lo < hi && (u64)C[lo].ts + (u64)WEEK_MS < (u64)start) {
-                            u32 c = C[lo].camp;
-                            if (--T.cnt[c] == 0) {
-                                int at = T.pos[c], last = T.active.back();
-                                T.active[at] = last;
-                                T.pos[last] = at;
-                                T.active.pop_back();
+                            if (!m) {
+                                idx = (u32)L.pid.size();
+                                L.pid.push_back(person);
+                                L.mk[h] = person;
+                                L.mv[h] = idx;
+                                if (L.pid.size() * 2 > L.mk.size()) rehash();
+                                break;
                             }
-                            lo++;
+                            h = (h + 1) & L.mmask;
                         }
-                        u32 credited = hi > lo ? C[hi - 1].camp : 0;
-                        size_t cell = (size_t)credited * NDAYS + day;
-                        T.cs[cell] += 1;
-                        T.cps[cell] += purch;
-                        T.crev[cell] += rev;
-                        for (int c : T.active) T.cas[(size_t)c * NDAYS + day] += 1;
-                        s = e;
+                        const u64 key = ((u64)idx << 32) | r[k].ts;
+                        KT[i++] = key;
+                        if (r[k].aux) L.pur.push_back(PK{key, r[k].aux, 0});
                     }
-                    flush_day();
-                    for (int c : T.active) T.cnt[c] = 0;
-                    T.active.clear();
-                    i = j;
                 }
+            // counting sort by the dense person index, then each person's times
+            {
+                const size_t npers = L.pid.size();
+                L.cnt.assign(npers + 1, 0);
+                u32* cn = L.cnt.data();
+                for (size_t x = 0; x < ne; x++) cn[(KT[x] >> 32) + 1]++;
+                for (size_t x = 0; x < npers; x++) cn[x + 1] += cn[x];
+                for (size_t x = 0; x < ne; x++) K[cn[KT[x] >> 32]++] = KT[x];
+                // cn[q] is now the end of person q's run
+                size_t a0 = 0;
+                for (size_t q = 0; q < npers; q++) {
+                    const size_t a1 = cn[q];
+                    const size_t len = a1 - a0;
+                    if (len > 1) {
+                        if (len <= 16) {
+                            for (size_t x = a0 + 1; x < a1; x++) {
+                                const u64 v = K[x];
+                                size_t y = x;
+                                while (y > a0 && K[y - 1] > v) K[y] = K[y - 1], y--;
+                                K[y] = v;
+                            }
+                        } else
+                            sort(K + a0, K + a1);
+                    }
+                    a0 = a1;
+                }
+            }
+            sort(L.pur.begin(), L.pur.end(), [](const PK& x, const PK& y) { return x.key < y.key; });
+            for (auto& sc : scs)
+                for (Blk* b = sc.head[p]; b; b = b->next) {
+                    const CRec* c = bdata<CRec>(b);
+                    for (u32 k = 0; k < b->n; k++) {
+                        const u64 person = c[k].person;
+                        u64 h = mix64(person) & L.mmask;
+                        for (;;) {
+                            const u64 m = L.mk[h];
+                            if (m == person) {
+                                L.ck.push_back(CK{((u64)L.mv[h] << 32) | c[k].ts, c[k].cid, c[k].camp, 0});
+                                break;
+                            }
+                            if (!m) break;  // a person with clicks but no events
+                            h = (h + 1) & L.mmask;
+                        }
+                    }
+                }
+            // clicks: counting sort by person index, then each person's run by
+            // (ts, click_id descending) so the smallest click_id comes last
+            const size_t nc = L.ck.size();
+            if (L.ck2.size() < nc) L.ck2.resize(nc + nc / 4 + 16);
+            {
+                const size_t npers = L.pid.size();
+                L.cnt.assign(npers + 1, 0);
+                u32* cn = L.cnt.data();
+                const CK* src = L.ck.data();
+                CK* dst = L.ck2.data();
+                for (size_t x = 0; x < nc; x++) cn[(src[x].key >> 32) + 1]++;
+                for (size_t x = 0; x < npers; x++) cn[x + 1] += cn[x];
+                for (size_t x = 0; x < nc; x++) dst[cn[src[x].key >> 32]++] = src[x];
+                auto cl = [](const CK& x, const CK& y) {
+                    if (x.key != y.key) return x.key < y.key;
+                    if (x.cid == y.cid) return false;
+                    return key_less(y.cid, x.cid);
+                };
+                size_t a0 = 0;
+                for (size_t q = 0; q < npers; q++) {
+                    const size_t a1 = cn[q];
+                    if (a1 - a0 > 1) {
+                        if (a1 - a0 <= 16) {
+                            for (size_t x = a0 + 1; x < a1; x++) {
+                                const CK v = dst[x];
+                                size_t y = x;
+                                while (y > a0 && cl(v, dst[y - 1])) dst[y] = dst[y - 1], y--;
+                                dst[y] = v;
+                            }
+                        } else
+                            sort(dst + a0, dst + a1, cl);
+                    }
+                    a0 = a1;
+                }
+            }
+            const PK* P = L.pur.data();
+            const size_t npur = L.pur.size();
+            const CK* C = L.ck2.data();
+            size_t pp = 0, cp = 0;
+            i = 0;
+            while (i < ne) {
+                const u64 idx = K[i] >> 32;
+                size_t j = i + 1;
+                while (j < ne && (K[j] >> 32) == idx) j++;
+                const u64 person = L.pid[idx];
+                while (cp < nc && (C[cp].key >> 32) < idx) cp++;
+                const size_t cA = cp;
+                while (cp < nc && (C[cp].key >> 32) == idx) cp++;
+                const size_t cB = cp;
+                size_t lo = cA, hi = cA;
+                u32 cur_day = 0xFFFFFFFFu;
+                i32 d_ses = 0, d_evs = 0;
+                i64 d_rev = 0;
+                auto flush_day = [&]() {
+                    if (cur_day == 0xFFFFFFFFu) return;
+                    int best = -1;
+                    i64 bestv = -1;
+                    for (int c : T.touched) {
+                        i64 v = T.catsum[c];
+                        if (v > bestv || (v == bestv && c < best)) bestv = v, best = c;
+                        T.catsum[c] = 0;
+                    }
+                    T.touched.clear();
+                    T.uid.push_back(person);
+                    T.day.push_back((i32)(DAY0 + cur_day));
+                    T.ses.push_back(d_ses);
+                    T.evs.push_back(d_evs);
+                    T.rev.push_back(d_rev);
+                    T.top.push_back((i16)best);
+                    d_ses = d_evs = 0;
+                    d_rev = 0;
+                };
+                size_t s = i;
+                while (s < j) {
+                    const u32 start = (u32)K[s];
+                    size_t e = s + 1;
+                    while (e < j && (u32)K[e] - (u32)K[e - 1] <= (u32)GAP_MS) e++;
+                    const u32 day = (u32)((start + DAYBASE) / (u64)DAY_MS - DAYSHIFT);
+                    if (day != cur_day) {
+                        flush_day();
+                        cur_day = day;
+                    }
+                    i64 rev = 0;
+                    u32 purch = 0;
+                    const u64 last = K[e - 1];
+                    while (pp < npur && P[pp].key <= last) {
+                        const u32 aux = P[pp].aux;
+                        const u32 price = aux & 0xFFFFFFu, c = aux >> 24;
+                        purch = 1;
+                        rev += price;
+                        if (T.catsum[c] == 0) T.touched.push_back((int)c);
+                        T.catsum[c] += price;
+                        pp++;
+                    }
+                    d_ses += 1;
+                    d_evs += (i32)(e - s);
+                    d_rev += rev;
+                    while (hi < cB && (u32)C[hi].key <= start) {
+                        u32 c = C[hi].camp;
+                        if (T.cnt[c]++ == 0) T.pos[c] = (int)T.active.size(), T.active.push_back((int)c);
+                        hi++;
+                    }
+                    while (lo < hi && (u64)(u32)C[lo].key + (u64)WEEK_MS < (u64)start) {
+                        u32 c = C[lo].camp;
+                        if (--T.cnt[c] == 0) {
+                            int at = T.pos[c], lastc = T.active.back();
+                            T.active[at] = lastc;
+                            T.pos[lastc] = at;
+                            T.active.pop_back();
+                        }
+                        lo++;
+                    }
+                    u32 credited = hi > lo ? C[hi - 1].camp : 0;
+                    size_t cell = (size_t)credited * NDAYS + day;
+                    T.cs[cell] += 1;
+                    T.cps[cell] += purch;
+                    T.crev[cell] += rev;
+                    for (int c : T.active) T.cas[(size_t)c * NDAYS + day] += 1;
+                    s = e;
+                }
+                flush_day();
+                for (int c : T.active) T.cnt[c] = 0;
+                T.active.clear();
+                i = j;
             }
         });
         tick("sessions");
