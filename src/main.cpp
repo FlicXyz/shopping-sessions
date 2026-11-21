@@ -1360,7 +1360,7 @@ static void* slab_alloc(Slab& s, size_t n) {
     s.left -= n;
     return r;
 }
-struct Blk {
+struct alignas(64) Blk {  // 64 bytes, so block data is cache-line aligned
     Blk* next;
     u32 n;
     u32 pad;
@@ -1376,10 +1376,20 @@ struct Scatter {
     Slab* slab = nullptr;
     vector<R*> cur, end;
     vector<Blk*> head, tail;
+    // Records of 16 or 32 bytes are staged per partition in a cache line and
+    // written to the block a whole line at a time with a non-temporal store:
+    // no read-for-ownership of the (thousands of scattered) destination lines.
+    static constexpr int K = (sizeof(R) == 32) ? 2 : 0;
+    struct alignas(64) Line {
+        R r[K ? K : 1];
+    };
+    vector<Line> stg;
+    vector<u8> sn;
     void init(int np_, Slab* s, u32 recs) {
         np = np_;
         slab = s;
         brec = recs;
+        if (K) stg.assign(np, Line{}), sn.assign(np, 0);
         cur.assign(np, nullptr);
         end.assign(np, nullptr);
         head.assign(np, nullptr);
@@ -1405,6 +1415,25 @@ struct Scatter {
         end[p] = cur[p] + brec;
     }
     inline void push(int p, const R& r) {
+        if constexpr (K != 0) {
+            u32 c = sn[p];
+            stg[p].r[c] = r;
+            if (++c < (u32)K) {
+                sn[p] = (u8)c;
+                return;
+            }
+            sn[p] = 0;
+            if (__builtin_expect(cur[p] == end[p], 0)) grow(p);
+#ifdef __AVX512F__
+            _mm512_stream_si512((__m512i*)cur[p], _mm512_load_si512((const void*)&stg[p]));
+#else
+            const __m256i* src = (const __m256i*)&stg[p];
+            _mm256_stream_si256((__m256i*)cur[p], _mm256_load_si256(src));
+            _mm256_stream_si256((__m256i*)cur[p] + 1, _mm256_load_si256(src + 1));
+#endif
+            cur[p] += K;
+            return;
+        }
         if (__builtin_expect(cur[p] == end[p], 0)) grow(p);
         // the block's next lines are written soon: prefetch them for ownership
         // (2048+ scattered streams defeat the hardware prefetcher)
@@ -1412,6 +1441,14 @@ struct Scatter {
         *cur[p]++ = r;
     }
     void finish() {
+        if constexpr (K != 0) {
+            for (int p = 0; p < np; p++)
+                for (u32 c = 0; c < sn[p]; c++) {
+                    if (cur[p] == end[p]) grow(p);
+                    *cur[p]++ = stg[p].r[c];
+                }
+            _mm_sfence();
+        }
         for (int p = 0; p < np; p++)
             if (tail[p]) tail[p]->n = (u32)(cur[p] - bdata<R>(tail[p]));
     }
