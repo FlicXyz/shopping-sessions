@@ -6,7 +6,7 @@ REPO=/mnt/c/Users/user/dev/shopping-sessions
 SS=$HOME/ss
 PY=$HOME/venv/bin/python
 cd "$REPO" || exit 1
-W=$(g++ -O3 -std=c++17 -march=x86-64-v3 -fno-stack-protector -Wall -Wextra -pthread -o "$SS/bin/pipeline" src/main.cpp 2>&1 | grep -cE "error|warning")
+W=$(clang++-18 -O3 -std=c++17 -static -march=x86-64-v3 -fno-stack-protector -Wall -Wextra -pthread -o "$SS/bin/pipeline" src/main.cpp 2>&1 | grep -cE "error|warning")
 [ -x "$SS/bin/pipeline" ] && [ "$W" = 0 ] || { echo "G1 build: FAIL ($W errors/warnings)"; exit 1; }
 echo "G1 build: ok"
 SS_SELFTEST=5 "$SS/bin/pipeline" 2>"$SS/st.txt"; R=$(tail -1 "$SS/st.txt")

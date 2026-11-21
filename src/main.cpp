@@ -884,26 +884,6 @@ static void write_campaign_daily(const vector<i64>& cs, const vector<i64>& cps, 
     write_parquet(OUT_DIR + "/campaign_daily/part-0.parquet", (i64)n, cols);
 }
 
-// Concurrent union-find: parents always point to a smaller index.
-static inline u32 uf_find(atomic<u32>* par, u32 x) {
-    for (;;) {
-        u32 p = par[x].load(memory_order_relaxed);
-        if (p == x) return x;
-        u32 gp = par[p].load(memory_order_relaxed);
-        if (gp != p) par[x].compare_exchange_weak(p, gp, memory_order_relaxed);
-        x = gp;
-    }
-}
-static inline void uf_union(atomic<u32>* par, u32 a, u32 b) {
-    for (;;) {
-        a = uf_find(par, a);
-        b = uf_find(par, b);
-        if (a == b) return;
-        if (a < b) swap(a, b);
-        u32 exp = a;
-        if (par[a].compare_exchange_strong(exp, b)) return;
-    }
-}
 
 // Links -> a flat table split into NLP equal sub-tables by the top LB bits of
 // the key's hash. Each linked ID maps to its person's name.
