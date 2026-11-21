@@ -1755,6 +1755,7 @@ static void run() {
                     if (!parse_event(p, fs, fe, bufend, r)) return;
                     se.push((int)(mix64(r.eid) >> sh), r);
                 });
+                _mm_sfence();  // this thread's non-temporal stores are globally visible before the join
             } else {
                 // Click tasks come after every event task, so the links are
                 // normally built by now. Persons are resolved in batches of 32
