@@ -64,8 +64,12 @@ static inline u64 mix64(u64 x) {
     return x;
 }
 
+// Thread count for par_for; a thread may override it (the links thread runs
+// its own par_for calls serially while the parse workers run).
+static thread_local int PAR_NT = 0;
 template <class F>
 static void par_for(int n, F&& f) {
+    const int NT = PAR_NT ? PAR_NT : ::NT;
     atomic<int> next(0);
     auto work = [&](int tid) {
         for (;;) {
@@ -1571,6 +1575,7 @@ struct Thr {
     Slab slab;
     Scatter<EvRec> se;
     Scatter<CRec> sc;
+    Scatter<CRec> craw;  // clicks before person resolution (one list)
     Scatter<PRec> sp;
     // pass 3 outputs
     vector<u64> uid;
@@ -1605,8 +1610,15 @@ static void run() {
     for (auto& t : th) {
         t.se.init(NPE, &t.slab, 512);
         t.sc.init(NPP, &t.slab, 256);
+        t.craw.init(1, &t.slab, 8192);
         t.sp.init(NPP, &t.slab, 1024);
     }
+    // ---- links build on their own thread, overlapped with the parse -------------
+    thread links_thread([] {
+        PAR_NT = getenv("SS_LINK_NT") ? max(1, atoi(getenv("SS_LINK_NT"))) : 2;
+        build_links();
+        tick("links built (overlapped)");
+    });
     // ---- pass 1: parse events and clicks ------------------------------------------
     {
         size_t total = EV_BYTES + CL_BYTES;
@@ -1670,22 +1682,9 @@ static void run() {
                     se.push((int)(mix64(r.eid) >> sh), r);
                 });
             } else {
-                Scatter<CRec>& sc = T.sc;
-                const int sh = 64 - PP_BITS;
-                struct Pend {
-                    u64 user;
-                    CRec c;
-                };
-                Pend pend[32];
-                int np = 0;
-                auto flush = [&]() {
-                    for (int i = 0; i < np; i++) {
-                        CRec c = pend[i].c;
-                        c.person = person_of(pend[i].user);
-                        sc.push((int)(mix64(c.person) >> sh), c);
-                    }
-                    np = 0;
-                };
+                // Clicks keep their raw user key (links may still be building);
+                // persons are resolved in pass 2.
+                Scatter<CRec>& cr = T.craw;
                 for_lines_fast(t, [&](const char* p, size_t len, const u32* cp, int nc, int nq) {
                     u32 fs[4], fe[4];
                     if (!fields<4>(p, len, cp, nc, nq, fs, fe)) return;
@@ -1696,21 +1695,20 @@ static void run() {
                     u64 ck = key_find(p + fs[2], l2);
                     const KV* ce = ck ? CAMPAIGNS.get(ck) : nullptr;
                     if (!ce) return;
-                    Pend& q = pend[np++];
-                    q.user = key_of_fast(p + fs[1], l1, bufend);
-                    person_prefetch(q.user);
-                    q.c.person = 0;
-                    q.c.cid = key_of_fast(p + fs[0], l0, bufend);
-                    q.c.ts = (u32)(ts - CBASE);
-                    q.c.camp = (u32)ce->v;
-                    if (np == 32) flush();
+                    CRec c;
+                    c.person = key_of_fast(p + fs[1], l1, bufend);  // user key for now
+                    c.cid = key_of_fast(p + fs[0], l0, bufend);
+                    c.ts = (u32)(ts - CBASE);
+                    c.camp = (u32)ce->v;
+                    cr.push(0, c);
                 });
-                flush();
             }
         });
-        for (auto& t : th) t.se.finish(), t.sc.finish();
+        for (auto& t : th) t.se.finish(), t.craw.finish();
         tick("parse events+clicks");
     }
+    links_thread.join();
+    tick("links joined");
 
     // ---- pass 2: dedup events, map to persons ---------------------------------------
     {
@@ -1719,7 +1717,26 @@ static void run() {
         for (auto& t : th) ses.push_back(t.se);
         vector<vector<EvRec>> bufs(NT);
         vector<vector<u32>> tabs(NT);
-        par_for(NPE, [&](int p, int tid) {
+        par_for(NT + NPE, [&](int task, int tid) {
+            if (task < NT) {
+                // clicks parsed by thread `task`: resolve persons (prefetched), scatter
+                Scatter<CRec>& sc = th[tid].sc;
+                const int sh = 64 - PP_BITS;
+                for (Blk* b = th[task].craw.head[0]; b; b = b->next) {
+                    CRec* c = bdata<CRec>(b);
+                    const u32 n = b->n;
+                    const u32 D = 16;
+                    for (u32 i = 0; i < n && i < D; i++) person_prefetch(c[i].person);
+                    for (u32 i = 0; i < n; i++) {
+                        if (i + D < n) person_prefetch(c[i + D].person);
+                        CRec x = c[i];
+                        x.person = person_of(x.person);
+                        sc.push((int)(mix64(x.person) >> sh), x);
+                    }
+                }
+                return;
+            }
+            const int p = task - NT;
             auto& buf = bufs[tid];
             size_t n = gather(ses, p, buf);
             if (!n) return;
@@ -1771,7 +1788,7 @@ static void run() {
             }
             flush();
         });
-        for (auto& t : th) t.sp.finish();
+        for (auto& t : th) t.sp.finish(), t.sc.finish();
         tick("dedup");
     }
 
@@ -2120,17 +2137,17 @@ int main(int argc, char** argv) {
 
     load_inputs(DATA);
     tick("lookups");
-    build_links();
-    tick("links");
-
     // The fast path stores times as u32 ms since window_start - 7 days and
     // a category in 8 bits.
     bool fast_ok = WE > WS && (WE - (WS - WEEK_MS)) < (i64)0xFFFFFFF0LL && CATNAMES.size() <= 256 &&
                    getenv("SS_GENERIC") == nullptr;
     if (fast_ok)
-        fast::run();
-    else
+        fast::run();  // builds links itself, overlapped with its parse
+    else {
+        build_links();
+        tick("links");
         generic::run();
+    }
     fflush(stdout);
     _exit(0);  // skip freeing large structures
 }
