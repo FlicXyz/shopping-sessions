@@ -26,7 +26,9 @@
 #include <fcntl.h>
 #include <immintrin.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 using namespace std;
@@ -46,9 +48,12 @@ static int NT = 8;
 static bool DBG = false;
 static chrono::steady_clock::time_point T0;
 static void tick(const char* what) {
-    if (DBG)
-        fprintf(stderr, "%9.3f ms  %s\n",
-                chrono::duration<double, milli>(chrono::steady_clock::now() - T0).count(), what);
+    if (DBG) {
+        rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+        fprintf(stderr, "%9.3f ms  %s  [minflt %ld]\n",
+                chrono::duration<double, milli>(chrono::steady_clock::now() - T0).count(), what, (long)ru.ru_minflt);
+    }
 }
 static void die(const char* msg) {
     fprintf(stderr, "fatal: %s\n", msg);
@@ -614,7 +619,10 @@ struct ColData {
 static void put32(string& s, u32 v) { s.append((const char*)&v, 4); }
 
 static void write_parquet(const string& path, i64 nrows, const vector<ColData>& cols) {
-    string out = "PAR1";
+    // The file is "PAR1", per column a page header and its page, then the
+    // footer; written with writev straight from the page buffers.
+    vector<string> hdr;
+    i64 pos = 4;
     vector<i64> offs, sizes;
     i64 total = 0;
     if (nrows > 0) {
@@ -630,11 +638,11 @@ static void write_parquet(const string& path, i64 nrows, const vector<ColData>& 
             h.fi32(4, 3);
             h.send();
             h.b.push_back(0);
-            offs.push_back((i64)out.size());
-            out += h.b;
-            out += c.page;
+            offs.push_back(pos);
             sizes.push_back((i64)(h.b.size() + c.page.size()));
+            pos += sizes.back();
             total += sizes.back();
+            hdr.push_back(h.b);
         }
     }
     TW f;
@@ -696,16 +704,26 @@ static void write_parquet(const string& path, i64 nrows, const vector<ColData>& 
     }
     f.fstr(6, "shopping-sessions");
     f.b.push_back(0);
-    out += f.b;
-    put32(out, (u32)f.b.size());
-    out += "PAR1";
+    string tail = f.b;
+    put32(tail, (u32)f.b.size());
+    tail += "PAR1";
+    vector<iovec> iov;
+    static const char MAGIC[4] = {'P', 'A', 'R', '1'};
+    iov.push_back({(void*)MAGIC, 4});
+    for (size_t i = 0; i < hdr.size(); i++) {
+        iov.push_back({(void*)hdr[i].data(), hdr[i].size()});
+        if (!cols[i].page.empty()) iov.push_back({(void*)cols[i].page.data(), cols[i].page.size()});
+    }
+    iov.push_back({(void*)tail.data(), tail.size()});
     int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) die("cannot write output");
-    size_t done = 0;
-    while (done < out.size()) {
-        ssize_t w = write(fd, out.data() + done, out.size() - done);
+    size_t k = 0;
+    while (k < iov.size()) {
+        ssize_t w = writev(fd, iov.data() + k, (int)min<size_t>(iov.size() - k, 1024));
         if (w <= 0) die("write failed");
-        done += (size_t)w;
+        size_t left = (size_t)w;
+        while (k < iov.size() && left >= iov[k].iov_len) left -= iov[k].iov_len, k++;
+        if (left) iov[k].iov_base = (char*)iov[k].iov_base + left, iov[k].iov_len -= left;
     }
     close(fd);
 }
@@ -1741,6 +1759,15 @@ static void run() {
         t.cnt.assign(NCAMP, 0);
         t.pos.assign(NCAMP, 0);
         t.catsum.assign(NCAT, 0);
+        // output rows (person-days): about 1 per 8 events; reserved so the
+        // columns do not grow by copying into freshly faulted pages
+        const size_t est = EV_BYTES / 512 / NT + 1024;
+        t.uid.reserve(est);
+        t.day.reserve(est);
+        t.ses.reserve(est);
+        t.evs.reserve(est);
+        t.rev.reserve(est);
+        t.top.reserve(est);
     }
     {
         vector<Scatter<PRec>> sps;

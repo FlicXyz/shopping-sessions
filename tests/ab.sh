@@ -8,7 +8,7 @@ for r in $(seq "$RUNS"); do
   for side in A B; do
     BIN=$A; EX=${ENV_A:-}; [ $side = B ] && BIN=$B && EX=${ENV_B:-}
     rm -rf "$OUT"/*
-    env $EX SS_DEBUG=1 NCPU=$N taskset -c "$CPUS" "$BIN" "$DATA" "$OUT" 2>&1 | grep -v overlapped | awk -v s=$side '{t=$1; $1=""; $2=""; sub(/^ +/,""); d=t-prev; prev=t; print s "\t" $0 "\t" d}; END {print s "\ttotal\t" prev}'
+    env $EX SS_DEBUG=1 NCPU=$N taskset -c "$CPUS" "$BIN" "$DATA" "$OUT" 2>&1 | grep -v overlapped | awk -v s=$side '{t=$1; $1=""; $2=""; sub(/^ +/,""); sub(/ +[[]minflt.*$/,""); d=t-prev; prev=t; print s "\t" $0 "\t" d}; END {print s "\ttotal\t" prev}'
   done
 done | awk -F'\t' '
   { k=$1 SUBSEP $2; v[k]=v[k] " " $3; if (!($2 in seen)) { seen[$2]=1; order[++n]=$2 } }
