@@ -1546,6 +1546,86 @@ __attribute__((flatten)) static void for_lines_fast(const Task& t, F&& f) {
     }
 }
 
+// Event lines (7 fields): the whole line is classified from 128 bytes of
+// masks at once. Calls g(p, fs, fe) for every well-formed line, with the field
+// bounds already stripped of their quotes. Lines of 128+ bytes and lines near
+// the end of the buffer take the general path (scan_line + fields).
+typedef unsigned __int128 u128;
+static inline u32 ctz128(u128 x) {
+    const u64 lo = (u64)x;
+    return lo ? (u32)__builtin_ctzll(lo) : 64 + (u32)__builtin_ctzll((u64)(x >> 64));
+}
+static inline u64 pxor64(u64 v) {
+    v ^= v << 1;
+    v ^= v << 2;
+    v ^= v << 4;
+    v ^= v << 8;
+    v ^= v << 16;
+    v ^= v << 32;
+    return v;
+}
+template <class G>
+__attribute__((flatten)) static void for_lines7(const Task& t, G&& g) {
+    const char* b = t.b;
+    const char* bufend = b + t.size;
+    size_t pos = first_line(t);
+    const __m256i NLv = _mm256_set1_epi8('\n'), CMv = _mm256_set1_epi8(','), QTv = _mm256_set1_epi8('"');
+    u32 fs[7], fe[7];
+    while (pos < t.end) {
+        const char* p = b + pos;
+        if (__builtin_expect(p + 128 <= bufend, 1)) {
+            const __m256i v0 = _mm256_loadu_si256((const __m256i*)p);
+            const __m256i v1 = _mm256_loadu_si256((const __m256i*)(p + 32));
+            const __m256i v2 = _mm256_loadu_si256((const __m256i*)(p + 64));
+            const __m256i v3 = _mm256_loadu_si256((const __m256i*)(p + 96));
+#define SS_MASK64(a, c0, c1) \
+    ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, a)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, a)) << 32))
+            const u64 n0 = SS_MASK64(NLv, v0, v1), n1 = SS_MASK64(NLv, v2, v3);
+            if (__builtin_expect((n0 | n1) != 0, 1)) {
+                const u32 L = n0 ? (u32)__builtin_ctzll(n0) : 64 + (u32)__builtin_ctzll(n1);
+                const u128 lim = ((u128)1 << L) - 1;
+                const u128 cm = ((u128)SS_MASK64(CMv, v2, v3) << 64 | SS_MASK64(CMv, v0, v1)) & lim;
+                pos += L + 1;
+                const u64 cmlo = (u64)cm, cmhi = (u64)(cm >> 64);
+                if (__builtin_popcountll(cmlo) + __builtin_popcountll(cmhi) != 6) continue;
+                u128 x = cm;
+                fs[0] = 0;
+                for (int k = 0; k < 6; k++) {
+                    const u32 c = ctz128(x);
+                    x &= x - 1;
+                    fe[k] = c;
+                    fs[k + 1] = c + 1;
+                }
+                fe[6] = L;
+                const u128 qt = ((u128)SS_MASK64(QTv, v2, v3) << 64 | SS_MASK64(QTv, v0, v1)) & lim;
+                if (qt) {
+                    // Quotes only at a field's first or last byte, and an even
+                    // number of them before every separator and the line end.
+                    const u128 FS = (cm << 1) | 1, FE = (cm >> 1) | ((u128)1 << (L - 1));
+                    if (qt & ~(FS | FE)) continue;
+                    const u64 qlo = (u64)qt, qhi = (u64)(qt >> 64);
+                    const u64 ilo = pxor64(qlo), ihi = pxor64(qhi) ^ (0 - (u64)(__builtin_popcountll(qlo) & 1));
+                    const u128 in = ((u128)ihi << 64) | ilo;
+                    if (in & (cm | ((u128)1 << L))) continue;
+                    for (int k = 0; k < 7; k++) {
+                        const u32 q = (u32)(qt >> fs[k]) & 1;
+                        fs[k] += q;
+                        fe[k] -= q;
+                    }
+                }
+#undef SS_MASK64
+                g(p, fs, fe);
+                continue;
+            }
+        }
+        u32 cpos[8];
+        int nc, nq;
+        const size_t len = scan_line(p, bufend, cpos, nc, nq);
+        if (fields<7>(p, len, cpos, nc, nq, fs, fe)) g(p, (const u32*)fs, (const u32*)fe);
+        pos += len + 1;
+    }
+}
+
 static inline u32 load4(const char* p) {
     u32 v;
     memcpy(&v, p, 4);
@@ -1555,6 +1635,54 @@ static inline u64 load8(const char* p) {
     u64 v;
     memcpy(&v, p, 8);
     return v;
+}
+
+// One well-formed event line (field bounds fs/fe) -> r; false if event_id is empty.
+__attribute__((always_inline)) static inline bool parse_event(const char* p, const u32* fs, const u32* fe,
+                                                               const char* bufend, EvRec& r) {
+    u32 l0 = fe[0] - fs[0];
+    if (!l0) return false;
+    r.eid = key_of_fast(p + fs[0], l0, bufend);
+    i64 ing;
+    if (!parse_ts_fast(p + fs[3], fe[3] - fs[3], ing)) ing = INT64_MAX;
+    r.ingest = ing;
+    r.user = 0;
+    r.ts = BAD_TS;
+    r.aux = 0;
+    do {
+        u32 l1 = fe[1] - fs[1];
+        if (!l1) break;
+        i64 ts;
+        if (!parse_ts_fast(p + fs[2], fe[2] - fs[2], ts) || ts < WS || ts >= WE) break;
+        u32 l4 = fe[4] - fs[4];
+        const char* ty = p + fs[4];
+        int type;
+        if (l4 == 4) {
+            u32 w = load4(ty);
+            if (w == 0x77656976u)  // "view"
+                type = 0;
+            else if (w == 0x74726163u)  // "cart"
+                type = 1;
+            else
+                break;
+        } else if (l4 == 8 && load8(ty) == 0x6573616863727570ULL)  // "purchase"
+            type = 2;
+        else
+            break;
+        if (fe[5] == fs[5]) break;
+        u32 price = 0;
+        if (type == 2 && !parse_price(p + fs[6], fe[6] - fs[6], price)) break;
+        if (ing - ts > DAY_MS) break;
+        r.user = key_of_fast(p + fs[1], l1, bufend);
+        r.ts = (u32)(ts - CBASE);
+        if (type == 2) {
+            u64 pk = key_find(p + fs[5], fe[5] - fs[5]);
+            const KV* pe = pk ? PRODUCTS.get(pk) : nullptr;
+            u32 cat = (u32)(pe ? pe->v : (u64)UNKNOWN_CAT);
+            r.aux = price | (cat << 24);
+        }
+    } while (0);
+    return true;
 }
 
 // ---- per-thread state -----------------------------------------------------------
@@ -1622,52 +1750,9 @@ static void run() {
             if (t.kind == 0) {
                 Scatter<EvRec>& se = T.se;
                 const int sh = 64 - PE_BITS;
-                for_lines_fast(t, [&](const char* p, size_t len, const u32* cp, int nc, int nq) {
-                    u32 fs[7], fe[7];
-                    if (!fields<7>(p, len, cp, nc, nq, fs, fe)) return;
-                    u32 l0 = fe[0] - fs[0];
-                    if (!l0) return;
+                for_lines7(t, [&](const char* p, const u32* fs, const u32* fe) {
                     EvRec r;
-                    r.eid = key_of_fast(p + fs[0], l0, bufend);
-                    i64 ing;
-                    if (!parse_ts_fast(p + fs[3], fe[3] - fs[3], ing)) ing = INT64_MAX;
-                    r.ingest = ing;
-                    r.user = 0;
-                    r.ts = BAD_TS;
-                    r.aux = 0;
-                    do {
-                        u32 l1 = fe[1] - fs[1];
-                        if (!l1) break;
-                        i64 ts;
-                        if (!parse_ts_fast(p + fs[2], fe[2] - fs[2], ts) || ts < WS || ts >= WE) break;
-                        u32 l4 = fe[4] - fs[4];
-                        const char* ty = p + fs[4];
-                        int type;
-                        if (l4 == 4) {
-                            u32 w = load4(ty);
-                            if (w == 0x77656976u)  // "view"
-                                type = 0;
-                            else if (w == 0x74726163u)  // "cart"
-                                type = 1;
-                            else
-                                break;
-                        } else if (l4 == 8 && load8(ty) == 0x6573616863727570ULL)  // "purchase"
-                            type = 2;
-                        else
-                            break;
-                        if (fe[5] == fs[5]) break;
-                        u32 price = 0;
-                        if (type == 2 && !parse_price(p + fs[6], fe[6] - fs[6], price)) break;
-                        if (ing - ts > DAY_MS) break;
-                        r.user = key_of_fast(p + fs[1], l1, bufend);
-                        r.ts = (u32)(ts - CBASE);
-                        if (type == 2) {
-                            u64 pk = key_find(p + fs[5], fe[5] - fs[5]);
-                            const KV* pe = pk ? PRODUCTS.get(pk) : nullptr;
-                            u32 cat = (u32)(pe ? pe->v : (u64)UNKNOWN_CAT);
-                            r.aux = price | (cat << 24);
-                        }
-                    } while (0);
+                    if (!parse_event(p, fs, fe, bufend, r)) return;
                     se.push((int)(mix64(r.eid) >> sh), r);
                 });
             } else {
