@@ -482,6 +482,7 @@ static inline bool split(const char* p, const char* e, const char** fs, u32* fl)
 struct Mapped {
     const char* p = nullptr;
     size_t n = 0;
+    int fd = -1;  // kept open for the big inputs, which are read with pread
 };
 static Mapped map_file(const string& path) {
     Mapped m;
@@ -493,6 +494,8 @@ static Mapped map_file(const string& path) {
         if (a != MAP_FAILED) {
             m.p = (const char*)a;
             m.n = (size_t)st.st_size;
+            m.fd = fd;
+            return m;
         }
     }
     close(fd);
@@ -518,11 +521,12 @@ struct Task {
     const char* b;
     size_t size, begin, end;
     int kind;
+    int fd = -1;
 };
 static void add_tasks(vector<Task>& tasks, const vector<Mapped>& files, int kind, size_t chunk) {
     for (auto& m : files) {
         if (!m.n) continue;
-        for (size_t s = 0; s < m.n; s += chunk) tasks.push_back(Task{m.p, m.n, s, min(m.n, s + chunk), kind});
+        for (size_t s = 0; s < m.n; s += chunk) tasks.push_back(Task{m.p, m.n, s, min(m.n, s + chunk), kind, m.fd});
     }
 }
 // Position of the first data line starting in [t.begin, ...), skipping the header.
@@ -1402,6 +1406,9 @@ struct Scatter {
     }
     inline void push(int p, const R& r) {
         if (__builtin_expect(cur[p] == end[p], 0)) grow(p);
+        // the block's next lines are written soon: prefetch them for ownership
+        // (2048+ scattered streams defeat the hardware prefetcher)
+        __builtin_prefetch((const char*)cur[p] + 192, 1, 3);
         *cur[p]++ = r;
     }
     void finish() {
@@ -1430,6 +1437,7 @@ static size_t gather(vector<Scatter<R>>& sc, int p, vector<R>& out) {
 __attribute__((always_inline)) static inline size_t scan_line(const char* p, const char* bufend, u32* cpos, int& nc, int& nq) {
     nc = 0;
     nq = 0;
+
     const __m256i NLv = _mm256_set1_epi8('\n'), CMv = _mm256_set1_epi8(','), QTv = _mm256_set1_epi8('"');
     size_t off = 0;
     while (p + off + 32 <= bufend) {
@@ -1565,6 +1573,7 @@ static void run() {
     {
         size_t total = EV_BYTES + CL_BYTES;
         size_t chunk = max<size_t>(256 << 10, min<size_t>(4 << 20, total / (NT * 32) + 1));
+        if (getenv("SS_CHUNK")) chunk = (size_t)atoi(getenv("SS_CHUNK")) << 10;
         vector<Task> tasks;
         add_tasks(tasks, EVF, 0, chunk);
         add_tasks(tasks, CLF, 1, chunk);
