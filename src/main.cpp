@@ -1446,9 +1446,15 @@ struct Scatter {
         head.assign(np, nullptr);
         tail.assign(np, nullptr);
     }
+    vector<Blk*> free_blocks;  // recycled blocks of exactly this block size
     __attribute__((noinline)) void grow(int p) {
         if (tail[p]) tail[p]->n = brec;
-        Blk* b = (Blk*)slab_alloc(*slab, sizeof(Blk) + (size_t)brec * sizeof(R));
+        Blk* b;
+        if (!free_blocks.empty()) {
+            b = free_blocks.back();
+            free_blocks.pop_back();
+        } else
+            b = (Blk*)slab_alloc(*slab, sizeof(Blk) + (size_t)brec * sizeof(R));
         b->next = nullptr;
         b->n = 0;
         if (tail[p])
@@ -1609,6 +1615,7 @@ static void run() {
     vector<Thr> th(NT);
     for (auto& t : th) {
         t.se.init(NPE, &t.slab, 512);
+        static_assert(sizeof(EvRec) * 512 == sizeof(PRec) * 1024, "recycled event blocks must fit person blocks");
         t.sc.init(NPP, &t.slab, 256);
         t.craw.init(1, &t.slab, 8192);
         t.sp.init(NPP, &t.slab, 1024);
@@ -1717,6 +1724,7 @@ static void run() {
         for (auto& t : th) ses.push_back(t.se);
         vector<vector<EvRec>> bufs(NT);
         vector<vector<u32>> tabs(NT);
+        vector<vector<u8>> wins(NT);
         par_for(NT + NPE, [&](int task, int tid) {
             if (task < NT) {
                 // clicks parsed by thread `task`: resolve persons (prefetched), scatter
@@ -1740,6 +1748,12 @@ static void run() {
             auto& buf = bufs[tid];
             size_t n = gather(ses, p, buf);
             if (!n) return;
+            for (auto& sv : ses)  // these event blocks are dead now: reuse them for person records
+                for (Blk* b = sv.head[p]; b;) {
+                    Blk* nx = b->next;
+                    th[tid].sp.free_blocks.push_back(b);
+                    b = nx;
+                }
             size_t cap = 16;
             while (cap < n * 2) cap <<= 1;
             auto& tab = tabs[tid];
@@ -1747,9 +1761,13 @@ static void run() {
             memset(tab.data(), 0, cap * sizeof(u32));
             const u64 mask = cap - 1;
             const EvRec* E = buf.data();
+            auto& win = wins[tid];
+            if (win.size() < n) win.resize(n + n / 4 + 16);
+            u8* W = win.data();
             for (u32 i = 0; i < (u32)n; i++) {
                 const u64 k = E[i].eid;
                 u64 s = mix64(k) & mask;
+                W[i] = 1;
                 for (;;) {
                     u32 x = tab[s];
                     if (!x) {
@@ -1757,7 +1775,11 @@ static void run() {
                         break;
                     }
                     if (E[x - 1].eid == k) {
-                        if (E[i].ingest < E[x - 1].ingest) tab[s] = i + 1;
+                        if (E[i].ingest < E[x - 1].ingest) {
+                            W[x - 1] = 0;
+                            tab[s] = i + 1;
+                        } else
+                            W[i] = 0;
                         break;
                     }
                     s = (s + 1) & mask;
@@ -1777,11 +1799,9 @@ static void run() {
                 }
                 np = 0;
             };
-            for (size_t s = 0; s < cap; s++) {
-                u32 x = tab[s];
-                if (!x) continue;
-                const EvRec* r = &E[x - 1];
-                if (r->ts == BAD_TS) continue;
+            for (size_t x = 0; x < n; x++) {
+                const EvRec* r = &E[x];
+                if (!W[x] || r->ts == BAD_TS) continue;
                 person_prefetch(r->user);
                 pend[np++] = r;
                 if (np == 32) flush();
