@@ -1375,24 +1375,28 @@ struct Scatter {
     int np = 0;
     u32 brec = 0;
     Slab* slab = nullptr;
-    vector<R*> cur, end;
+    struct CE {
+        R* cur;
+        R* end;
+    };
+    vector<CE> ce;  // write pointer and block end, together in one line
     vector<Blk*> head, tail;
-    // Records of 16 or 32 bytes are staged per partition in a cache line and
-    // written to the block a whole line at a time with a non-temporal store:
-    // no read-for-ownership of the (thousands of scattered) destination lines.
-    static constexpr int K = (sizeof(R) == 32) ? 2 : 0;
+    // 32-byte records are staged per partition in a cache line and written to
+    // the block a whole line at a time with a non-temporal store: no
+    // read-for-ownership of the (thousands of scattered) destination lines.
+    // cur advances per record; its parity (block data is line aligned) tells
+    // which half of the staging line the record goes to.
+    static constexpr bool NT = sizeof(R) == 32;
     struct alignas(64) Line {
-        R r[K ? K : 1];
+        R r[2];
     };
     vector<Line> stg;
-    vector<u8> sn;
     void init(int np_, Slab* s, u32 recs) {
         np = np_;
         slab = s;
         brec = recs;
-        if (K) stg.assign(np, Line{}), sn.assign(np, 0);
-        cur.assign(np, nullptr);
-        end.assign(np, nullptr);
+        if (NT) stg.assign(np, Line{});
+        ce.assign(np, CE{nullptr, nullptr});
         head.assign(np, nullptr);
         tail.assign(np, nullptr);
     }
@@ -1412,46 +1416,51 @@ struct Scatter {
         else
             head[p] = b;
         tail[p] = b;
-        cur[p] = bdata<R>(b);
-        end[p] = cur[p] + brec;
+        ce[p].cur = bdata<R>(b);
+        ce[p].end = ce[p].cur + brec;
     }
     inline void push(int p, const R& r) {
-        if constexpr (K != 0) {
-            u32 c = sn[p];
-            stg[p].r[c] = r;
-            if (++c < (u32)K) {
-                sn[p] = (u8)c;
-                return;
-            }
-            sn[p] = 0;
-            if (__builtin_expect(cur[p] == end[p], 0)) grow(p);
+        if constexpr (NT) {
+            R* c = ce[p].cur;
+            if ((uintptr_t)c & 32) {
+                stg[p].r[1] = r;
 #ifdef __AVX512F__
-            _mm512_stream_si512((__m512i*)cur[p], _mm512_load_si512((const void*)&stg[p]));
+                _mm512_stream_si512((__m512i*)(c - 1), _mm512_load_si512((const void*)&stg[p]));
 #else
-            const __m256i* src = (const __m256i*)&stg[p];
-            _mm256_stream_si256((__m256i*)cur[p], _mm256_load_si256(src));
-            _mm256_stream_si256((__m256i*)cur[p] + 1, _mm256_load_si256(src + 1));
+                const __m256i* src = (const __m256i*)&stg[p];
+                _mm256_stream_si256((__m256i*)(c - 1), _mm256_load_si256(src));
+                _mm256_stream_si256((__m256i*)(c - 1) + 1, _mm256_load_si256(src + 1));
 #endif
-            cur[p] += K;
+            } else {
+                if (__builtin_expect(c == ce[p].end, 0)) {
+                    grow(p);
+                    c = ce[p].cur;
+                }
+                stg[p].r[0] = r;
+            }
+            ce[p].cur = c + 1;
             return;
         }
-        if (__builtin_expect(cur[p] == end[p], 0)) grow(p);
+        R* c = ce[p].cur;
+        if (__builtin_expect(c == ce[p].end, 0)) {
+            grow(p);
+            c = ce[p].cur;
+        }
         // the block's next lines are written soon: prefetch them for ownership
-        // (2048+ scattered streams defeat the hardware prefetcher)
-        __builtin_prefetch((const char*)cur[p] + 192, 1, 3);
-        *cur[p]++ = r;
+        // (thousands of scattered streams defeat the hardware prefetcher)
+        __builtin_prefetch((const char*)c + 192, 1, 3);
+        *c = r;
+        ce[p].cur = c + 1;
     }
     void finish() {
-        if constexpr (K != 0) {
+        if constexpr (NT) {
+            // a staged first half whose line was never streamed
             for (int p = 0; p < np; p++)
-                for (u32 c = 0; c < sn[p]; c++) {
-                    if (cur[p] == end[p]) grow(p);
-                    *cur[p]++ = stg[p].r[c];
-                }
+                if ((uintptr_t)ce[p].cur & 32) ce[p].cur[-1] = stg[p].r[0];
             _mm_sfence();
         }
         for (int p = 0; p < np; p++)
-            if (tail[p]) tail[p]->n = (u32)(cur[p] - bdata<R>(tail[p]));
+            if (tail[p]) tail[p]->n = (u32)(ce[p].cur - bdata<R>(tail[p]));
     }
 };
 template <class R>
@@ -1715,7 +1724,10 @@ static void run() {
         while (b < hi && ((u64)1 << b) * per < n) b++;
         return b;
     };
-    PE_BITS = bits_for(est_events, getenv("SS_PE") ? (u64)atoi(getenv("SS_PE")) : 12000, 6, 13);
+    // at most 2048 event partitions: more makes the parse scatter (per-partition
+    // staging lines and write pointers) spill out of L2, which costs more than
+    // the larger dedup partitions
+    PE_BITS = bits_for(est_events, getenv("SS_PE") ? (u64)atoi(getenv("SS_PE")) : 12000, 6, 11);
     NPE = 1 << PE_BITS;
     PP_BITS = bits_for(est_events, getenv("SS_PP") ? (u64)atoi(getenv("SS_PP")) : 64000, 6, 13);
     NPP = 1 << PP_BITS;
