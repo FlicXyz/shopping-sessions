@@ -1540,7 +1540,7 @@ static void run() {
     };
     PE_BITS = bits_for(est_events, getenv("SS_PE") ? (u64)atoi(getenv("SS_PE")) : 12000, 6, 13);
     NPE = 1 << PE_BITS;
-    PP_BITS = bits_for(est_events, getenv("SS_PP") ? (u64)atoi(getenv("SS_PP")) : 16000, 6, 13);
+    PP_BITS = bits_for(est_events, getenv("SS_PP") ? (u64)atoi(getenv("SS_PP")) : 64000, 6, 13);
     NPP = 1 << PP_BITS;
 
     vector<Thr> th(NT);
@@ -1656,6 +1656,7 @@ static void run() {
         vector<vector<EvRec>> bufs(NT);
         vector<vector<u32>> tabs(NT);
         vector<vector<u8>> wins(NT);
+        vector<vector<u32>> survs(NT);
         par_for(NT + NPE, [&](int task, int tid) {
             if (task < NT) {
                 // clicks parsed by thread `task`: resolve persons (prefetched), scatter
@@ -1718,26 +1719,27 @@ static void run() {
             }
             Scatter<PRec>& sp = th[tid].sp;
             const int sh = 64 - PP_BITS;
-            const EvRec* pend[32];
-            int np = 0;
-            auto flush = [&]() {
-                for (int i = 0; i < np; i++) {
-                    PRec q;
-                    q.person = person_of(pend[i]->user);
-                    q.ts = pend[i]->ts;
-                    q.aux = pend[i]->aux;
-                    sp.push((int)(mix64(q.person) >> sh), q);
-                }
-                np = 0;
-            };
-            for (size_t x = 0; x < n; x++) {
-                const EvRec* r = &E[x];
-                if (!W[x] || r->ts == BAD_TS) continue;
-                person_prefetch(r->user);
-                pend[np++] = r;
-                if (np == 32) flush();
+            // compact the survivors, then resolve persons with a steady
+            // 16-ahead prefetch pipeline
+            auto& sv = survs[tid];
+            if (sv.size() < n) sv.resize(n + n / 4 + 16);
+            u32* S = sv.data();
+            u32 ns = 0;
+            for (u32 x = 0; x < (u32)n; x++) {
+                S[ns] = x;
+                ns += W[x] & (E[x].ts != BAD_TS);
             }
-            flush();
+            const u32 D = 16;
+            for (u32 i = 0; i < ns && i < D; i++) person_prefetch(E[S[i]].user);
+            for (u32 i = 0; i < ns; i++) {
+                if (i + D < ns) person_prefetch(E[S[i + D]].user);
+                const EvRec& r = E[S[i]];
+                PRec q;
+                q.person = person_of(r.user);
+                q.ts = r.ts;
+                q.aux = r.aux;
+                sp.push((int)(mix64(q.person) >> sh), q);
+            }
         });
         for (auto& t : th) t.sp.finish(), t.sc.finish();
         tick("dedup");
