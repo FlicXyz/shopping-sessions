@@ -764,6 +764,58 @@ static int UNKNOWN_CAT;
 static FMap CAMPAIGNS;                   // campaign key -> 1..N
 static vector<string> CAMP_ID, CAMP_CH;  // index 0 = organic
 static vector<Mapped> EVF, CLF, LKF;
+// IDs of the files' own shape (a short prefix and a canonical decimal number,
+// like p123 or c_45) are looked up by the number in a small array. The map
+// from such a string to (prefix, number) is one-to-one, so a hit or a miss
+// there is exact; any other string falls back to the hash map.
+struct NumIdx {
+    char pre[4] = {0, 0, 0, 0};
+    u32 plen = 0;
+    vector<u32> v;  // number -> value + 1, 0 = no such ID
+    bool on = false;
+    void build(const FMap& m, u32 add) {
+        string first;
+        for (auto& e : m.t)
+            if (e.k) { first = key_str(e.k); break; }
+        size_t d = 0;
+        while (d < first.size() && !D(first[d])) d++;
+        if (first.empty() || d == 0 || d > 4 || d == first.size()) return;
+        plen = (u32)d;
+        memcpy(pre, first.data(), d);
+        for (auto& e : m.t) {
+            if (!e.k) continue;
+            string sk = key_str(e.k);
+            u64 num;
+            if (!parse(sk.data(), (u32)sk.size(), num)) continue;
+            if (num >= (1u << 20)) continue;  // such IDs are never found by number: see find
+            if (v.size() <= num) v.resize(max<size_t>(num + 1, v.size() * 2), 0);
+            v[num] = (u32)e.v + add;
+        }
+        on = true;
+    }
+    inline bool parse(const char* p, u32 n, u64& num) const {
+        if (n <= plen || n > plen + 6 || memcmp(p, pre, plen) != 0) return false;
+        const char* q = p + plen;
+        const u32 nd = n - plen;
+        if (q[0] == '0' && nd > 1) return false;
+        u64 x = 0;
+        for (u32 i = 0; i < nd; i++) {
+            const u32 c = (u8)(q[i] - '0');
+            if (c > 9) return false;
+            x = x * 10 + c;
+        }
+        num = x;
+        return true;
+    }
+    // value + add for an ID of the shape, 0 if no such ID, -1 if not of the shape
+    inline i64 find(const char* p, u32 n) const {
+        u64 num;
+        if (!on || !parse(p, n, num) || num >= (1u << 20)) return -1;
+        return num < v.size() ? (i64)v[num] : 0;
+    }
+};
+static NumIdx PIDX, CIDX;
+
 static size_t EV_BYTES, CL_BYTES, LK_BYTES;
 static string OUT_DIR;
 
@@ -834,6 +886,7 @@ static void load_inputs(const string& DATA) {
             KV* s = PRODUCTS.slot(r.first);
             if (!s->k) s->k = r.first, s->v = (u64)rank[r.second];
         }
+        PIDX.build(PRODUCTS, 1);
     }
     {
         string text = read_small(DATA + "/campaigns.csv");
@@ -855,6 +908,7 @@ static void load_inputs(const string& DATA) {
             CAMP_ID.push_back(key_str(r.first));
             CAMP_CH.push_back(r.second);
         }
+        CIDX.build(CAMPAIGNS, 0);
     }
     auto map_all = [&](const string& dir, size_t& bytes) {
         vector<Mapped> v;
@@ -1355,7 +1409,10 @@ static void* slab_alloc(Slab& s, size_t n) {
     s.left -= n;
     return r;
 }
-struct alignas(64) Blk {  // 64 bytes, so block data is cache-line aligned
+#ifndef SS_STG
+#define SS_STG 4
+#endif
+struct alignas(32 * SS_STG < 64 ? 64 : 32 * SS_STG) Blk {  // block data aligned to a whole staging buffer
     Blk* next;
     u32 n;
     u32 pad;
@@ -1381,8 +1438,9 @@ struct Scatter {
     // cur advances per record; its parity (block data is line aligned) tells
     // which half of the staging line the record goes to.
     static constexpr bool NT = sizeof(R) == 32;
+    static constexpr int S = SS_STG;  // records staged per partition, streamed together
     struct alignas(64) Line {
-        R r[2];
+        R r[S];
     };
     vector<Line> stg;
     void init(int np_, Slab* s, u32 recs) {
@@ -1416,21 +1474,21 @@ struct Scatter {
     inline void push(int p, const R& r) {
         if constexpr (NT) {
             R* c = ce[p].cur;
-            if ((uintptr_t)c & 32) {
-                stg[p].r[1] = r;
+            const u32 i = (u32)((uintptr_t)c >> 5) & (S - 1);
+            if (__builtin_expect(c == ce[p].end, 0)) {  // only ever at i == 0
+                grow(p);
+                c = ce[p].cur;
+            }
+            stg[p].r[i] = r;
+            if (i == S - 1) {
+                R* d = c - (S - 1);
 #ifdef __AVX512F__
-                _mm512_stream_si512((__m512i*)(c - 1), _mm512_load_si512((const void*)&stg[p]));
+                for (int k = 0; k < S / 2; k++)
+                    _mm512_stream_si512((__m512i*)(d + 2 * k), _mm512_load_si512((const void*)&stg[p].r[2 * k]));
 #else
-                const __m256i* src = (const __m256i*)&stg[p];
-                _mm256_stream_si256((__m256i*)(c - 1), _mm256_load_si256(src));
-                _mm256_stream_si256((__m256i*)(c - 1) + 1, _mm256_load_si256(src + 1));
+                for (int k = 0; k < S; k++)
+                    _mm256_stream_si256((__m256i*)(d + k), _mm256_load_si256((const __m256i*)&stg[p].r[k]));
 #endif
-            } else {
-                if (__builtin_expect(c == ce[p].end, 0)) {
-                    grow(p);
-                    c = ce[p].cur;
-                }
-                stg[p].r[0] = r;
             }
             ce[p].cur = c + 1;
             return;
@@ -1449,8 +1507,11 @@ struct Scatter {
     void finish() {
         if constexpr (NT) {
             // a staged first half whose line was never streamed
-            for (int p = 0; p < np; p++)
-                if ((uintptr_t)ce[p].cur & 32) ce[p].cur[-1] = stg[p].r[0];
+            for (int p = 0; p < np; p++) {
+                R* c = ce[p].cur;
+                const u32 i = (u32)((uintptr_t)c >> 5) & (S - 1);
+                for (u32 k = 0; k < i; k++) c[(int)k - (int)i] = stg[p].r[k];
+            }
             _mm_sfence();
         }
         for (int p = 0; p < np; p++)
@@ -1756,9 +1817,15 @@ __attribute__((always_inline)) static inline bool parse_event(const char* p, con
         r.user = key_of_fast(p + fs[1], l1, bufend);
         r.ts = (u32)(ts - CBASE);
         if (type == 2) {
-            u64 pk = key_find(p + fs[5], fe[5] - fs[5]);
-            const KV* pe = pk ? PRODUCTS.get(pk) : nullptr;
-            u32 cat = (u32)(pe ? pe->v : (u64)UNKNOWN_CAT);
+            const i64 hit = PIDX.find(p + fs[5], fe[5] - fs[5]);
+            u32 cat;
+            if (hit >= 0)
+                cat = hit ? (u32)(hit - 1) : (u32)UNKNOWN_CAT;
+            else {
+                u64 pk = key_find(p + fs[5], fe[5] - fs[5]);
+                const KV* pe = pk ? PRODUCTS.get(pk) : nullptr;
+                cat = (u32)(pe ? pe->v : (u64)UNKNOWN_CAT);
+            }
             r.aux = price | (cat << 24);
         }
     } while (0);
@@ -1863,14 +1930,18 @@ static void run() {
                     if (!l0 || !l1 || !l2) return;
                     i64 ts;
                     if (!parse_ts_fast(p + fs[3], fe[3] - fs[3], ts) || ts < CBASE || ts >= WE) return;
-                    u64 ck = key_find(p + fs[2], l2);
-                    const KV* ce = ck ? CAMPAIGNS.get(ck) : nullptr;
-                    if (!ce) return;
+                    i64 camp = CIDX.find(p + fs[2], l2);
+                    if (camp < 0) {
+                        u64 ck = key_find(p + fs[2], l2);
+                        const KV* ce = ck ? CAMPAIGNS.get(ck) : nullptr;
+                        camp = ce ? (i64)ce->v : 0;
+                    }
+                    if (!camp) return;
                     CRec c;
                     c.person = key_of_fast(p + fs[1], l1, bufend);  // user key for now
                     c.cid = key_of_fast(p + fs[0], l0, bufend);
                     c.ts = (u32)(ts - CBASE);
-                    c.camp = (u32)ce->v;
+                    c.camp = (u32)camp;
                     pend[np++] = c;
                     if (np == 32) flush();
                 });
