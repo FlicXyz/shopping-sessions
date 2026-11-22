@@ -61,13 +61,11 @@ static void die(const char* msg) {
     exit(1);
 }
 
+// One multiply: the high half is well mixed (partitions take the top bits),
+// and folding it into the low half mixes the low bits (tables mask them).
 static inline u64 mix64(u64 x) {
-    x ^= x >> 31;
-    x *= 0x7fb5d329728ea185ULL;
-    x ^= x >> 27;
-    x *= 0x81dadef4bc2dd44dULL;
-    x ^= x >> 33;
-    return x;
+    x *= 0x9E3779B97F4A7C15ULL;
+    return x ^ (x >> 32);
 }
 
 // Thread count for par_for; a thread may override it (the links thread runs
