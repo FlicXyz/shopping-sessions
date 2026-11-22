@@ -1637,9 +1637,6 @@ __attribute__((flatten)) static void for_lines7(const Task& t, G&& g) {
         const char* p = b + pos;
         __builtin_prefetch(p + 8192);  // the input a few pages ahead: page cache pages are 4 KB, past the reach of the hardware prefetcher
         if (__builtin_expect(p + 128 <= bufend, 1)) {
-#ifndef SS_YES512
-#define SS_NO512
-#endif
 #if defined(__AVX512BW__) && !defined(SS_NO512)
             const __m512i w0 = _mm512_loadu_si512((const void*)p);
             const __m512i w1 = _mm512_loadu_si512((const void*)(p + 64));
