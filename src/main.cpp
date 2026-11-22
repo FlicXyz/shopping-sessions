@@ -1637,6 +1637,7 @@ __attribute__((flatten)) static void for_lines7(const Task& t, G&& g) {
     u32 fs[7], fe[7];
     while (pos < t.end) {
         const char* p = b + pos;
+        __builtin_prefetch(p + 8192);  // the input a few pages ahead: page cache pages are 4 KB, past the reach of the hardware prefetcher
         if (__builtin_expect(p + 128 <= bufend, 1)) {
 #ifdef __AVX512BW__
             const __m512i w0 = _mm512_loadu_si512((const void*)p);
@@ -1717,6 +1718,7 @@ __attribute__((flatten)) static void for_lines_short(const Task& t, G&& g) {
     u32 fs[NF], fe[NF];
     while (pos < t.end) {
         const char* p = b + pos;
+        __builtin_prefetch(p + 4096);
         if (__builtin_expect(p + 64 <= bufend, 1)) {
 #ifdef __AVX512BW__
             const __m512i w0 = _mm512_loadu_si512((const void*)p);
