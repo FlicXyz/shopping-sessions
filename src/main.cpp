@@ -1577,12 +1577,22 @@ __attribute__((flatten)) static void for_lines7(const Task& t, G&& g) {
     while (pos < t.end) {
         const char* p = b + pos;
         if (__builtin_expect(p + 128 <= bufend, 1)) {
+#ifdef __AVX512BW__
+            const __m512i w0 = _mm512_loadu_si512((const void*)p);
+            const __m512i w1 = _mm512_loadu_si512((const void*)(p + 64));
+#define SS_MASK64(a, c0, c1) ((u64)_mm512_cmpeq_epi8_mask(c0, _mm512_broadcast_i64x4(a)))
+#define v0 w0
+#define v1 w0
+#define v2 w1
+#define v3 w1
+#else
             const __m256i v0 = _mm256_loadu_si256((const __m256i*)p);
             const __m256i v1 = _mm256_loadu_si256((const __m256i*)(p + 32));
             const __m256i v2 = _mm256_loadu_si256((const __m256i*)(p + 64));
             const __m256i v3 = _mm256_loadu_si256((const __m256i*)(p + 96));
 #define SS_MASK64(a, c0, c1) \
     ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, a)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, a)) << 32))
+#endif
             const u64 n0 = SS_MASK64(NLv, v0, v1), n1 = SS_MASK64(NLv, v2, v3);
             if (__builtin_expect((n0 | n1) != 0, 1)) {
                 const u32 L = n0 ? (u32)__builtin_ctzll(n0) : 64 + (u32)__builtin_ctzll(n1);
@@ -1617,6 +1627,12 @@ __attribute__((flatten)) static void for_lines7(const Task& t, G&& g) {
                     }
                 }
 #undef SS_MASK64
+#ifdef __AVX512BW__
+#undef v0
+#undef v1
+#undef v2
+#undef v3
+#endif
                 g(p, fs, fe);
                 continue;
             }
@@ -1625,6 +1641,67 @@ __attribute__((flatten)) static void for_lines7(const Task& t, G&& g) {
         int nc, nq;
         const size_t len = scan_line(p, bufend, cpos, nc, nq);
         if (fields<7>(p, len, cpos, nc, nq, fs, fe)) g(p, (const u32*)fs, (const u32*)fe);
+        pos += len + 1;
+    }
+}
+
+// Short lines (clicks, links): the same idea as for_lines7 with a 64-byte
+// window. Lines of 64+ bytes or near the buffer end take the general path.
+template <int NF, class G>
+__attribute__((flatten)) static void for_lines_short(const Task& t, G&& g) {
+    const char* b = t.b;
+    const char* bufend = b + t.size;
+    size_t pos = first_line(t);
+    const __m256i NLv = _mm256_set1_epi8('\n'), CMv = _mm256_set1_epi8(','), QTv = _mm256_set1_epi8('"');
+    u32 fs[NF], fe[NF];
+    while (pos < t.end) {
+        const char* p = b + pos;
+        if (__builtin_expect(p + 64 <= bufend, 1)) {
+#ifdef __AVX512BW__
+            const __m512i w0 = _mm512_loadu_si512((const void*)p);
+#define SS_MASK64(a, c0, c1) ((u64)_mm512_cmpeq_epi8_mask(w0, _mm512_broadcast_i64x4(a)))
+#else
+            const __m256i v0 = _mm256_loadu_si256((const __m256i*)p);
+            const __m256i v1 = _mm256_loadu_si256((const __m256i*)(p + 32));
+#define SS_MASK64(a, c0, c1) \
+    ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, a)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, a)) << 32))
+#endif
+            const u64 n0 = SS_MASK64(NLv, v0, v1);
+            if (__builtin_expect(n0 != 0, 1)) {
+                const u32 L = (u32)__builtin_ctzll(n0);
+                const u64 lim = (n0 - 1) & ~n0;  // bits below L
+                const u64 cm = SS_MASK64(CMv, v0, v1) & lim;
+                pos += L + 1;
+                if (__builtin_popcountll(cm) != NF - 1) continue;
+                u64 x = cm;
+                fs[0] = 0;
+                for (int k = 0; k < NF - 1; k++) {
+                    const u32 c = (u32)__builtin_ctzll(x);
+                    x &= x - 1;
+                    fe[k] = c;
+                    fs[k + 1] = c + 1;
+                }
+                fe[NF - 1] = L;
+                const u64 qt = SS_MASK64(QTv, v0, v1) & lim;
+                if (qt) {
+                    const u64 FS = (cm << 1) | 1, FE = (cm >> 1) | ((u64)1 << (L - 1));
+                    if (qt & ~(FS | FE)) continue;
+                    if (pxor64(qt) & (cm | ((u64)1 << L))) continue;
+                    for (int k = 0; k < NF; k++) {
+                        const u32 q = (u32)(qt >> fs[k]) & 1;
+                        fs[k] += q;
+                        fe[k] -= q;
+                    }
+                }
+#undef SS_MASK64
+                g(p, (const u32*)fs, (const u32*)fe);
+                continue;
+            }
+        }
+        u32 cpos[8];
+        int nc, nq;
+        const size_t len = scan_line(p, bufend, cpos, nc, nq);
+        if (fields<NF>(p, len, cpos, nc, nq, fs, fe)) g(p, (const u32*)fs, (const u32*)fe);
         pos += len + 1;
     }
 }
@@ -1781,9 +1858,7 @@ static void run() {
                     }
                     np = 0;
                 };
-                for_lines_fast(t, [&](const char* p, size_t len, const u32* cp, int nc, int nq) {
-                    u32 fs[4], fe[4];
-                    if (!fields<4>(p, len, cp, nc, nq, fs, fe)) return;
+                for_lines_short<4>(t, [&](const char* p, const u32* fs, const u32* fe) {
                     u32 l0 = fe[0] - fs[0], l1 = fe[1] - fs[1], l2 = fe[2] - fs[2];
                     if (!l0 || !l1 || !l2) return;
                     i64 ts;
@@ -2303,9 +2378,7 @@ static void build_links() {
         if (!m.n) continue;
         Task t{m.p, m.n, 0, m.n, 2};
         const char* const bufend = m.p + m.n;
-        fast::for_lines_fast(t, [&](const char* p, size_t len, const u32* cp, int nc, int nq) {
-            u32 fs[2], fe[2];
-            if (!fast::fields<2>(p, len, cp, nc, nq, fs, fe)) return;
+        fast::for_lines_short<2>(t, [&](const char* p, const u32* fs, const u32* fe) {
             const u32 l0 = fe[0] - fs[0], l1 = fe[1] - fs[1];
             if (!l0 || !l1) return;
             A.push_back(key_of_fast(p + fs[0], l0, bufend));
